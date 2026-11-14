@@ -39,6 +39,8 @@ env:
   CROSS_COMPILE_COMPAT: "arm-linux-gnueabi-"
   CLANG_TRIPLE: "aarch64-linux-gnu-"
   CC: "clang"
+  HOSTCC: "/usr/bin/gcc"
+  HOSTCXX: "/usr/bin/g++"
 
 jobs:
   Build-Kernel:
@@ -57,12 +59,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex curl git zip ftp lftp zstd wget \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libssl-dev libfl-dev libelf-dev libyaml-dev pkg-config \
             python3 python-is-python3 libarchive-tools \
             device-tree-compiler cpio kmod rsync jq ccache
 
-      - name: "💫 Get Toolchains (Clang 11 & GAS)"
+      - name: "💫 Get Toolchains (Clang 11 & ARM GAS)"
         run: |
           mkdir -p "$HOME/toolchains"
           cd "$HOME/toolchains"
@@ -80,9 +82,14 @@ jobs:
             https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r383902.git \
             clang
 
+          # Remove ancient x86_64 host assemblers (binutils 2.27) so HOSTCC uses Ubuntu's /usr/bin/as (fixes endbr64 error)
+          rm -f "$HOME/toolchains/gas/as" \
+                "$HOME/toolchains/gas/x86_64-"* \
+                "$HOME/toolchains/clang/bin/as" \
+                "$HOME/toolchains/clang/bin/ld" \
+                "$HOME/toolchains/clang/bin/x86_64-"*
+
           echo "$HOME/toolchains/gas" >> $GITHUB_PATH
-          echo "$HOME/toolchains/gas/bin" >> $GITHUB_PATH
-          echo "$HOME/toolchains/clang" >> $GITHUB_PATH
           echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
 
       - name: "🔧 Apply gta4lve 4.14 Source Fixes"
@@ -131,6 +138,7 @@ jobs:
           ARGS="-j$(nproc --all) O=${GITHUB_WORKSPACE}/${OUT_DIR}"
           ARGS="$ARGS ARCH=${ARCH} SUBARCH=${SUBARCH}"
           ARGS="$ARGS CC=${CC}"
+          ARGS="$ARGS HOSTCC=${HOSTCC} HOSTCXX=${HOSTCXX}"
           ARGS="$ARGS CLANG_TRIPLE=${CLANG_TRIPLE}"
           ARGS="$ARGS CROSS_COMPILE=${CROSS_COMPILE}"
           ARGS="$ARGS CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32}"
@@ -144,14 +152,21 @@ jobs:
         run: |
           which clang
           clang --version
-          make ${BUILD_ARGS} ${{ env.DEFCONFIG_NAME }}
+          which as
+          as --version
+          make ${BUILD_ARGS} \
+            KBUILD_HOSTCFLAGS="-B/usr/bin -fcf-protection=none -fcommon -Wno-error" \
+            HOSTCFLAGS="-B/usr/bin -fcf-protection=none -fcommon -Wno-error" \
+            ${{ env.DEFCONFIG_NAME }}
 
       - name: "🎶 Compile Kernel"
         env:
           BUILD_ARGS: ${{ steps.generate-args.outputs.args }}
         run: |
           make ${BUILD_ARGS} \
-            KCFLAGS="-g0 -Wno-error -Wno-macro-redefined" \
+            KBUILD_HOSTCFLAGS="-B/usr/bin -fcf-protection=none -fcommon -Wno-error" \
+            HOSTCFLAGS="-B/usr/bin -fcf-protection=none -fcommon -Wno-error" \
+            KCFLAGS="-g0 -Wno-error -Wno-macro-redefined -Wno-unused-variable" \
             KBUILD_CFLAGS_KERNEL="-g0" \
             2>&1 | tee build.log
 
