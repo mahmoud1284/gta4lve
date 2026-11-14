@@ -581,7 +581,7 @@ index 000000000..af7022a85
 +};
 +
 +static inline bool jobctl_frozen(struct task_struct* task) {
-+	return ((task->jobctl & JOBCTL_TRAP_FREEZE) != 0);
++	return freezing(task);
 +}
 +static inline bool frozen_task_group(struct task_struct* task) {
 +	return (jobctl_frozen(task) || cgroup_freezing(task));
