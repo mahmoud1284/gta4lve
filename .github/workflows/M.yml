@@ -197,15 +197,14 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           # Do not call build_kernel.sh here: it runs defconfig again and would
           # discard the feature changes made in the previous step.
-          # This 4.14 DTC enables YAML when yaml.h is present, but its legacy
-          # host-link rule can omit -lyaml. YAML input is not needed to build
-          # this device tree, so disable the optional YAML frontend explicitly.
+          # Kernel 4.14 names this variable HOSTLDLIBS_dtc, while its
+          # Makefile.host linker consumes HOSTLOADLIBES_<program>.
+          # Normalize the legacy name so DTC is linked with libyaml correctly.
           sed -i \
-            -e '/^[[:space:]]*dtc-objs[[:space:]]*+= yamltree\.o[[:space:]]*$/d' \
-            -e '/^[[:space:]]*HOSTLDLIBS_dtc[[:space:]]*:=.*-lyaml[[:space:]]*$/d' \
+            -e 's/^HOSTLDLIBS_dtc[[:space:]]*:=/HOSTLOADLIBES_dtc :=/' \
             scripts/dtc/Makefile
-          ! grep -Eq 'yamltree\.o|HOSTLDLIBS_dtc.*-lyaml' scripts/dtc/Makefile
-          make -C . O=out NO_YAML=1 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
+          grep -q '^HOSTLOADLIBES_dtc[[:space:]]*:=[[:space:]]*-lyaml' scripts/dtc/Makefile
+          make -C . O=out BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
             ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- -j"$(nproc)"
           test -s out/arch/arm64/boot/Image
 
