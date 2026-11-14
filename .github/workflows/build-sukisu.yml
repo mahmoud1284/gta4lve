@@ -1,0 +1,98 @@
+name: Build Kernel (SukiSU + SUSFS + NoMount)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build kernel with Sukisu Ultra, SUSFS and NoMount
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            gcc-aarch64-linux-gnu python3 git patch
+
+      - name: Integrate SukiSU Ultra (builtin)
+        run: |
+          git clone --depth 1 -b builtin \
+            https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          mkdir -p drivers/kernelsu
+          cp -a KernelSU/kernel/. drivers/kernelsu/
+          grep -q "kernelsu" drivers/Makefile || printf "\nobj-\$(CONFIG_KSU) += kernelsu/\n" >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          echo "SukiSU integrated"
+
+      - name: Integrate SUSFS
+        run: |
+          git clone --depth 1 -b kernel-4.14 \
+            https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+          cp -f /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          mkdir -p include/linux
+          cp -f /tmp/susfs4ksu/kernel_patches/include/linux/* include/linux/
+          patch -p1 --forward < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
+          echo "SUSFS integrated"
+
+      - name: Integrate NoMount
+        run: |
+          git clone --depth 1 https://github.com/maxsteeel/nomount.git /tmp/nomount
+          mkdir -p fs/nomount
+          cp -f /tmp/nomount/kernel/src/* fs/nomount/
+          grep -q "nomount" fs/Makefile || printf "\nobj-\$(CONFIG_NOMOUNT) += nomount/\n" >> fs/Makefile
+          grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig || \
+            sed -i '/endmenu/i\source "fs/nomount/Kconfig"' fs/Kconfig
+          echo "NoMount integrated"
+
+      - name: Enable feature configs
+        run: |
+          DEFCONFIG=arch/arm64/configs/gta4lve_eur_open_defconfig
+          {
+            echo ""
+            echo "# SukiSU Ultra / SUSFS / NoMount"
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y"
+            echo "CONFIG_NOMOUNT=y"
+            echo "CONFIG_KALLSYMS=y"
+            echo "CONFIG_KALLSYMS_ALL=y"
+          } >> "$DEFCONFIG"
+          echo "Feature configs enabled"
+
+      - name: Configure kernel
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            gta4lve_eur_open_defconfig
+
+      - name: Build kernel
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j$(nproc) Image dtbs
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sukisu-susfs-nomount
+          path: |
+            arch/arm64/boot/Image
+            arch/arm64/boot/Image.gz
+            arch/arm64/boot/dts/**/*.dtb
+          if-no-files-found: warn
