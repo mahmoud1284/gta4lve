@@ -3269,8 +3269,7 @@ void exit_mmap(struct mm_struct *mm)
 	while (vma) {
 		if (vma->vm_flags & VM_ACCOUNT)
 			nr_accounted += vma_pages(vma);
-		vma = __remove_vma(vma);
-		cond_resched();
+		vma = remove_vma(vma);
 	}
 	vm_unacct_memory(nr_accounted);
 }
