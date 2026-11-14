@@ -204,6 +204,23 @@ jobs:
             -e 's/^HOSTLDLIBS_dtc[[:space:]]*:=/HOSTLOADLIBES_dtc :=/' \
             scripts/dtc/Makefile
           grep -q '^HOSTLOADLIBES_dtc[[:space:]]*:=[[:space:]]*-lyaml' scripts/dtc/Makefile
+          # Clang treats the vendor Samsung debug warning as an error: the
+          # first helper computes which_el only for a commented-out log line.
+          # Keep the second helper unchanged because it uses which_el below.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("arch/arm64/include/asm/sec_debug.h")
+          text = path.read_text()
+          old_decl = "uint64_t pstate, which_el;"
+          old_pstate = "\n\tpstate = READ_SPECIAL_REG(CurrentEl);"
+          old_assign = "\n\twhich_el = pstate & PSR_MODE_MASK;"
+          if old_decl not in text or old_pstate not in text or old_assign not in text:
+              raise SystemExit("sec_debug.h: expected unused which_el code was not found")
+          text = text.replace(old_decl, "", 1)
+          text = text.replace(old_pstate, "", 1)
+          text = text.replace(old_assign, "", 1)
+          path.write_text(text)
+          PY
           make -C . O=out BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
             ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- -j"$(nproc)"
           test -s out/arch/arm64/boot/Image
