@@ -56,7 +56,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex build-essential ccache clang lld llvm \
-            libssl-dev libelf-dev pahole python3 rsync unzip zip \
+            libssl-dev libelf-dev libyaml-dev pahole python3 rsync unzip zip \
             device-tree-compiler git curl ca-certificates gcc-aarch64-linux-gnu
 
       - name: Verify kernel tree
