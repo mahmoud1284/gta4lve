@@ -221,6 +221,22 @@ jobs:
           text = text.replace(old_assign, "", 1)
           path.write_text(text)
           PY
+          # The vendor writeback extension references symbols that do not
+          # exist in this 4.14 tree. Restore the upstream redirty path.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          path = Path("fs/fs-writeback.c")
+          text = path.read_text()
+          pattern = r"\n\t//\+\[EXT P220514-00579\].*?\n\t//-\[EXT P220514-00579\].*\n"
+          text, removed = re.subn(pattern, "\n", text, count=1, flags=re.S)
+          if removed != 1:
+              raise SystemExit("fs-writeback vendor block not found")
+          path.write_text(text)
+          PY
+          # This variable is declared by a vendor logging addition but is
+          # never read in the 4.14 balance_dirty_pages implementation.
+          sed -i '/unsigned long logtime_stamp = jiffies;/d' mm/page-writeback.c
           make -C . O=out BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
             ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- -j"$(nproc)"
           test -s out/arch/arm64/boot/Image
