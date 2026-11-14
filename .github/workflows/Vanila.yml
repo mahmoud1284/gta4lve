@@ -1,0 +1,233 @@
+name: "Build gta4lve Kernel"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: "Root / KernelSU Variant"
+        required: false
+        default: "none"
+        type: choice
+        options:
+          - none
+          - KernelSU-Next
+          - SukiSU-Ultra
+          - KernelSU-Official
+      package_anykernel:
+        description: "Package flashable AnyKernel3 ZIP"
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - "Documentation/**"
+
+env:
+  KERNEL_NAME: "Torkey-Next"
+  KERNEL_REPO: "https://github.com/mahmoud1284/gta4lve"
+  KERNEL_BRANCH: "main"
+  DEVICE_CODE: "gta4lve"
+  DEFCONFIG_NAME: "gta4lve_eur_open_defconfig"
+  OUT_DIR: "out"
+  ARCH: "arm64"
+  SUBARCH: "arm64"
+  CROSS_COMPILE: "aarch64-linux-gnu-"
+  CROSS_COMPILE_ARM32: "arm-linux-gnueabi-"
+  CROSS_COMPILE_COMPAT: "arm-linux-gnueabi-"
+  CLANG_TRIPLE: "aarch64-linux-gnu-"
+  CC: "clang"
+
+jobs:
+  Build-Kernel:
+    name: "🐎 Build gta4lve Kernel (4.14.190)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "😄 Checkout gta4lve Kernel Source"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: "⭐ Install Prerequisites"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex curl git zip ftp lftp zstd wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libssl-dev libfl-dev libelf-dev libyaml-dev pkg-config \
+            python3 python-is-python3 libarchive-tools \
+            device-tree-compiler cpio kmod rsync jq ccache
+
+      - name: "💫 Get Toolchains (Clang 11 & GAS)"
+        run: |
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+
+          # Clone Google prebuilt GAS
+          git clone --depth=1 -b master \
+            https://android.googlesource.com/platform/prebuilts/gas/linux-x86 \
+            gas
+
+          # Clone Standalone Clang 11 (with fallback mirror)
+          git clone --depth=1 -b 11 \
+            https://gitlab.com/ThankYouMario/android_prebuilts_clang-standalone.git \
+            clang || \
+          git clone --depth=1 -b lineage-18.1 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r383902.git \
+            clang
+
+          echo "$HOME/toolchains/gas" >> $GITHUB_PATH
+          echo "$HOME/toolchains/gas/bin" >> $GITHUB_PATH
+          echo "$HOME/toolchains/clang" >> $GITHUB_PATH
+          echo "$HOME/toolchains/clang/bin" >> $GITHUB_PATH
+
+      - name: "🔧 Apply gta4lve 4.14 Source Fixes"
+        run: |
+          # 1. Fix dtc YAML linker error on modern Ubuntu (yaml_emitter_emit)
+          if [ -f "scripts/dtc/Makefile" ] && ! grep -q "\-lyaml" scripts/dtc/Makefile; then
+            echo "HOSTLDLIBS_dtc += -lyaml" >> scripts/dtc/Makefile
+          fi
+
+          # 2. Fix strict prototype warning in bq25890_charger.c if present
+          if [ -f "drivers/power/supply/bq25890_charger.c" ]; then
+            sed -i 's/charger_get_manager()/charger_get_manager(void)/g' drivers/power/supply/bq25890_charger.c
+          fi
+
+          # 3. Guard SECTOR_SIZE macro redefinition if needed
+          if [ -f "include/uapi/linux/msdos_fs.h" ] && ! grep -q "#ifndef SECTOR_SIZE" include/uapi/linux/msdos_fs.h; then
+            sed -i 's/#define SECTOR_SIZE\b/#ifndef SECTOR_SIZE\n#define SECTOR_SIZE/' include/uapi/linux/msdos_fs.h
+            sed -i '/#define SECTOR_SIZE/a #endif' include/uapi/linux/msdos_fs.h
+          fi
+
+      - name: "😋 Integrate KernelSU (Optional)"
+        if: ${{ inputs.ksu_variant != '' && inputs.ksu_variant != 'none' }}
+        run: |
+          rm -rf ./KernelSU ./drivers/kernelsu
+
+          if [ "${{ inputs.ksu_variant }}" = "KernelSU-Next" ]; then
+            curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          elif [ "${{ inputs.ksu_variant }}" = "SukiSU-Ultra" ]; then
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+          elif [ "${{ inputs.ksu_variant }}" = "KernelSU-Official" ]; then
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+          fi
+
+          cat << 'EOF' >> ./arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG_NAME }}
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_OVERLAY_FS=y
+          EOF
+
+      - name: "😎 Set Build Arguments"
+        id: generate-args
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/${OUT_DIR}"
+          ARGS="-j$(nproc --all) O=${GITHUB_WORKSPACE}/${OUT_DIR}"
+          ARGS="$ARGS ARCH=${ARCH} SUBARCH=${SUBARCH}"
+          ARGS="$ARGS CC=${CC}"
+          ARGS="$ARGS CLANG_TRIPLE=${CLANG_TRIPLE}"
+          ARGS="$ARGS CROSS_COMPILE=${CROSS_COMPILE}"
+          ARGS="$ARGS CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32}"
+          ARGS="$ARGS CROSS_COMPILE_COMPAT=${CROSS_COMPILE_COMPAT}"
+          ARGS="$ARGS DTC_OVERLAY_VTS_EXT=true"
+          echo "args=${ARGS}" >> $GITHUB_OUTPUT
+
+      - name: "👍 Make Defconfig (${{ env.DEFCONFIG_NAME }})"
+        env:
+          BUILD_ARGS: ${{ steps.generate-args.outputs.args }}
+        run: |
+          which clang
+          clang --version
+          make ${BUILD_ARGS} ${{ env.DEFCONFIG_NAME }}
+
+      - name: "🎶 Compile Kernel"
+        env:
+          BUILD_ARGS: ${{ steps.generate-args.outputs.args }}
+        run: |
+          make ${BUILD_ARGS} \
+            KCFLAGS="-g0 -Wno-error -Wno-macro-redefined" \
+            KBUILD_CFLAGS_KERNEL="-g0" \
+            2>&1 | tee build.log
+
+      - name: "📦 Package AnyKernel3 Flashable ZIP"
+        if: ${{ inputs.package_anykernel != false && success() }}
+        run: |
+          if [ -f "${OUT_DIR}/arch/${ARCH}/boot/Image" ]; then
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+            rm -rf AnyKernel3/.git AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+            cp "${OUT_DIR}/arch/${ARCH}/boot/Image" AnyKernel3/
+
+            if [ -f "${OUT_DIR}/arch/${ARCH}/boot/dtb" ]; then
+              cp "${OUT_DIR}/arch/${ARCH}/boot/dtb" AnyKernel3/
+            fi
+            if [ -f "${OUT_DIR}/arch/${ARCH}/boot/dtbo.img" ]; then
+              cp "${OUT_DIR}/arch/${ARCH}/boot/dtbo.img" AnyKernel3/
+            fi
+
+            sed -i 's/device.name1=.*/device.name1=gta4lve/' AnyKernel3/anykernel.sh
+            sed -i 's/device.name2=.*/device.name2=SM-T509/' AnyKernel3/anykernel.sh
+            sed -i 's/do.devicecheck=1/do.devicecheck=0/' AnyKernel3/anykernel.sh
+            sed -i 's|block=.*|block=auto;|' AnyKernel3/anykernel.sh
+            sed -i 's/is_slot_device=0;/is_slot_device=auto;/' AnyKernel3/anykernel.sh
+
+            cd AnyKernel3
+            ZIP_NAME="${KERNEL_NAME}-${DEVICE_CODE}-4.14.190-$(date +%Y%m%d).zip"
+            zip -r9 "${GITHUB_WORKSPACE}/${ZIP_NAME}" * -x .git README.md *placeholder
+            echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          fi
+
+      - name: "💛 Upload Image"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ env.DEVICE_CODE }}-${{ env.KERNEL_NAME }}-${{ env.KERNEL_BRANCH }}
+          path: ./${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "💙 Upload Image.gz"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image.gz-${{ env.DEVICE_CODE }}-${{ env.KERNEL_NAME }}-${{ env.KERNEL_BRANCH }}
+          path: ./${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/Image.gz
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "💜 Upload dtb"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtb-${{ env.DEVICE_CODE }}-${{ env.KERNEL_NAME }}-${{ env.KERNEL_BRANCH }}
+          path: ./${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/dtb
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "❤️ Upload dtbo.img"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo.img-${{ env.DEVICE_CODE }}-${{ env.KERNEL_NAME }}-${{ env.KERNEL_BRANCH }}
+          path: ./${{ env.OUT_DIR }}/arch/${{ env.ARCH }}/boot/dtbo.img
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "💚 Upload AnyKernel3 Flashable ZIP"
+        if: ${{ env.ZIP_NAME != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-${{ env.DEVICE_CODE }}-${{ env.KERNEL_NAME }}
+          path: ./${{ env.ZIP_NAME }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: "📄 Upload Build Log (On Failure)"
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.DEVICE_CODE }}
+          path: ./build.log
+          if-no-files-found: ignore
+          retention-days: 7
