@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       enable_bbg:
-        description: "Enable BBG; requires patches/bbg.patch"
+        description: "Enable BBG via the official v1.1 setup script"
         type: boolean
         default: true
       enable_rekernel:
-        description: "Enable Re:Kernel; requires patches/rekernel.patch"
+        description: "Enable Re:Kernel 4.14 integration"
         type: boolean
         default: true
       enable_slmk:
@@ -24,6 +24,7 @@ on:
       - "mm/**"
       - "net/**"
       - "build_kernel.sh"
+      - "patches/**"
 
 permissions:
   contents: read
@@ -38,9 +39,7 @@ env:
   KERNEL_VERSION: 4.14.190
   NOMOUNT_REF: v2.3.0-720
   SUKISU_REF: main
-  SLMK_REF: linux-4.14
   BBG_REF: v1.1
-  REKERNEL_REF: main
 
 jobs:
   build:
@@ -58,7 +57,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             bc bison flex build-essential ccache clang lld llvm \
             libssl-dev libelf-dev pahole python3 rsync unzip zip \
-            device-tree-compiler git curl ca-certificates
+            device-tree-compiler git curl ca-certificates gcc-aarch64-linux-gnu
 
       - name: Verify kernel tree
         shell: bash
@@ -80,6 +79,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gta4lve-
 
+      - name: Apply legacy feature patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.enable_slmk }}" != "false" ]]; then
+            test -f patches/simple-lmk-4.14.patch
+            git apply --check patches/simple-lmk-4.14.patch
+            git apply patches/simple-lmk-4.14.patch
+          fi
+          if [[ "${{ inputs.enable_rekernel }}" != "false" ]]; then
+            test -f patches/rekernel-4.14.patch
+            git apply --check patches/rekernel-4.14.patch
+            git apply patches/rekernel-4.14.patch
+          fi
+
       - name: Integrate SukiSU Ultra
         shell: bash
         run: |
@@ -95,48 +109,20 @@ jobs:
           curl -LSs https://raw.githubusercontent.com/maxsteeel/nomount/${NOMOUNT_REF}/kernel/setup.sh \
             | bash -s "${NOMOUNT_REF}"
 
-      - name: Fetch optional feature sources
+      - name: Fetch feature sources
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p third_party
-          git clone --depth=1 --branch "${SLMK_REF}" https://github.com/kerneltoast/simple_lmk.git third_party/simple_lmk
           git clone --depth=1 --branch "${BBG_REF}" https://github.com/vc-teahouse/Baseband-guard.git third_party/baseband-guard
-          git clone --depth=1 --branch "${REKERNEL_REF}" https://github.com/Sakion-Team/Re-Kernel.git third_party/re-kernel
 
-      - name: Integrate Simple LMK
-        if: ${{ inputs.enable_slmk != false }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -d third_party/simple_lmk/drivers/staging/android/lowmemorykiller ]; then
-            mkdir -p drivers/staging/android
-            cp -a third_party/simple_lmk/drivers/staging/android/lowmemorykiller drivers/staging/android/
-          elif [ -d third_party/simple_lmk/drivers/misc/lowmemorykiller ]; then
-            mkdir -p drivers/misc
-            cp -a third_party/simple_lmk/drivers/misc/lowmemorykiller drivers/misc/
-          else
-            echo 'Simple LMK linux-4.14 layout is not compatible with this tree.' >&2
-            exit 1
-          fi
-
-      - name: Apply BBG patch
+      - name: Integrate BBG v1.1
         if: ${{ inputs.enable_bbg != false }}
         shell: bash
         run: |
           set -euo pipefail
-          test -f patches/bbg.patch || { echo 'Add a tested device-specific patches/bbg.patch'; exit 1; }
-          git apply --check patches/bbg.patch
-          git apply patches/bbg.patch
-
-      - name: Apply Re:Kernel patch
-        if: ${{ inputs.enable_rekernel != false }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f patches/rekernel.patch || { echo 'Add a tested device-specific patches/rekernel.patch'; exit 1; }
-          git apply --check patches/rekernel.patch
-          git apply patches/rekernel.patch
+          curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/${BBG_REF}/setup.sh \
+            | bash -s "${BBG_REF}"
 
       - name: Configure kernel features
         shell: bash
@@ -153,18 +139,44 @@ jobs:
           }
           set_config KSU y
           set_config KSU_SUSFS y
+          set_config KPM y
+          set_config KALLSYMS y
+          set_config KALLSYMS_ALL y
           set_config NOMOUNT y
+          if [[ "${{ inputs.enable_bbg }}" != "false" ]]; then
+            set_config BBG y
+          fi
+          if [[ "${{ inputs.enable_rekernel }}" != "false" ]]; then
+            set_config REKERNEL y
+          fi
+          if [[ "${{ inputs.enable_slmk }}" != "false" ]]; then
+            set_config ANDROID_SIMPLE_LMK y
+          fi
           set_config TCP_CONG_BBR y
           set_config DEFAULT_TCP_CONG bbr
           set_config ZRAM y
           set_config ZRAM_LZ4_COMPRESS y
           set_config CRYPTO_LZ4 y
           set_config LZ4_COMPRESS y
+          # GCC 4.9 and the vendor clang in this tree do not implement
+          # -fstack-protector-strong; regular stack protection is supported.
+          ./scripts/config --file out/.config --disable CC_STACKPROTECTOR_STRONG
+          ./scripts/config --file out/.config --enable CC_STACKPROTECTOR_REGULAR
           for gov in PERFORMANCE POWERSAVE USERSPACE ONDEMAND CONSERVATIVE INTERACTIVE SCHEDUTIL; do
             set_config CPU_FREQ_GOV_${gov} y
           done
           make O=out ARCH=arm64 olddefconfig
-          grep -E 'CONFIG_(KSU|KSU_SUSFS|NOMOUNT|TCP_CONG_BBR|DEFAULT_TCP_CONG|ZRAM|CRYPTO_LZ4|CPU_FREQ_GOV_)' out/.config | sort > out/feature-config.txt
+          required_symbols=(KSU KSU_SUSFS KPM KALLSYMS KALLSYMS_ALL NOMOUNT CC_STACKPROTECTOR_REGULAR)
+          [[ "${{ inputs.enable_bbg }}" == "false" ]] || required_symbols+=(BBG)
+          [[ "${{ inputs.enable_rekernel }}" == "false" ]] || required_symbols+=(REKERNEL)
+          for required in "${required_symbols[@]}"; do
+            grep -q "^CONFIG_${required}=y" out/.config || { echo "ERROR: CONFIG_${required} was not enabled"; exit 1; }
+          done
+          if [[ "${{ inputs.enable_slmk }}" != "false" ]]; then
+            grep -q '^CONFIG_ANDROID_SIMPLE_LMK=y' out/.config || { echo 'ERROR: CONFIG_ANDROID_SIMPLE_LMK was not enabled'; exit 1; }
+          fi
+          grep -q '^# CONFIG_CC_STACKPROTECTOR_STRONG is not set$' out/.config || { echo 'ERROR: strong stack protector is still enabled'; exit 1; }
+          grep -E 'CONFIG_(KSU|KPM|KALLSYMS|NOMOUNT|BBG|REKERNEL|ANDROID_SIMPLE_LMK|CC_STACKPROTECTOR|TCP_CONG_BBR|DEFAULT_TCP_CONG|ZRAM|CRYPTO_LZ4|CPU_FREQ_GOV_)' out/.config | sort > out/feature-config.txt
           cat out/feature-config.txt
 
       - name: Build kernel
@@ -172,9 +184,10 @@ jobs:
         run: |
           set -euo pipefail
           export ARCH=arm64
-          export CROSS_COMPILE="$(pwd)/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-"
-          export CLANG_TOOL_PATH="$(pwd)/toolchain/clang/host/linux-x86/clang-r383902/bin/"
-          export PATH="${CLANG_TOOL_PATH}:${PATH}"
+          # The repository does not contain the vendor toolchain. Use the
+          # reproducible Ubuntu cross-GCC plus the runner's LLVM toolchain.
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export PATH="/usr/lib/llvm-14/bin:${PATH}"
           export BSP_BUILD_FAMILY=qogirl6
           export DTC_OVERLAY_TEST_EXT="$(pwd)/tools/mkdtimg/ufdt_apply_overlay"
           export DTC_OVERLAY_VTS_EXT="$(pwd)/tools/mkdtimg/ufdt_verify_overlay_host"
