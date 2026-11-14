@@ -197,7 +197,10 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           # Do not call build_kernel.sh here: it runs defconfig again and would
           # discard the feature changes made in the previous step.
-          make -C . O=out BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
+          # This 4.14 DTC enables YAML when yaml.h is present, but its legacy
+          # host-link rule can omit -lyaml. YAML input is not needed to build
+          # this device tree, so disable the optional YAML frontend explicitly.
+          make -C . O=out NO_YAML=1 BSP_BUILD_DT_OVERLAY=y CC=clang LD=ld.lld \
             ARCH=arm64 CLANG_TRIPLE=aarch64-linux-gnu- -j"$(nproc)"
           test -s out/arch/arm64/boot/Image
 
