@@ -222,6 +222,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 		}
 		return sprintf(buf, "%s\n",
 			       power_supply_scope_text[value.intval]);
+	}
 	//+ add real type char text by guoyanjun
 	else if (off == POWER_SUPPLY_PROP_CHARGE_REAL_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_real_type_text)) {
@@ -231,6 +232,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 		}
 		return sprintf(buf, "%s\n",
 			       power_supply_real_type_text[value.intval]);
+	}
 	//- add real type char text by guoyanjun
 	//+ Bug 699037,guoyanjun.wt,ADD,2021/12/06,Add charging information node
 	else if (off == POWER_SUPPLY_PROP_NEW_CHARGE_TYPE) {
@@ -241,6 +243,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 		}
 		return sprintf(buf, "%s\n",
 			       power_supply_new_charge_type[value.intval]);
+	}
 	//- Bug 699037,guoyanjun.wt,ADD,2021/12/06,Add charging information node
 	//+ Bug  699041 ,guoyanjun.wt,ADD,2021/12/08,Add sys need node
 	else if (off == POWER_SUPPLY_PROP_OTG_TYPE) {
@@ -251,8 +254,9 @@ static ssize_t power_supply_show_property(struct device *dev,
 		}
 		return sprintf(buf, "%s\n",
 			       power_supply_otg_type[value.intval]);
+	}
 	//- Bug  699041 ,guoyanjun.wt,ADD,2021/12/08,Add sys need node
-	} else if (off >= POWER_SUPPLY_PROP_MODEL_NAME) {
+	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME) {
 		const char *strval = value.strval;
 		char probe_buf;
 		int probe_ret;
