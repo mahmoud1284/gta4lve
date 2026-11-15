@@ -145,6 +145,13 @@ jobs:
           ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
           echo "required configs present"
 
+      - name: Prepare kernel build
+        shell: bash
+        run: |
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 prepare
+
       - name: Build kernel
         shell: bash
         run: |
