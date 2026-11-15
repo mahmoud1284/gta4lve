@@ -148,13 +148,15 @@ __setup("batinfo=", battery_id_get);
 //-Bug 700264, modify guoyanjun.wt,20211103,add battery id info
 
 //+bug 707025, modify guoyanjun.wt 20190403 Add charger IC model information in factory mode
-extern bool is_sgm41542;
 static void charge_ic_get(void)
 {
-	if(is_sgm41542)
-		strcpy(charge_ic,"SGM41542");
+#ifdef CONFIG_CHARGER_BQ25890
+	extern bool is_sgm41542;
+	if (is_sgm41542)
+		strcpy(charge_ic, "SGM41542");
 	else
-		strcpy(charge_ic,"SY6970");
+#endif
+		strcpy(charge_ic, "SY6970");
 }
 //-bug 707025, modify guoyanjun.wt 20190403 Add charger IC model information in factory mode
 
