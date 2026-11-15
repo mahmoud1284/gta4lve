@@ -281,7 +281,9 @@ DTC_FLAGS += -Wno-unit_address_vs_reg \
 	-Wno-unit_address_format \
 	-Wno-pci_bridge \
 	-Wno-pci_device_bus_num \
-	-Wno-pci_device_reg
+	-Wno-pci_device_reg \
+	-Wno-sound_dai_property \
+	-Wno-graph_port
 endif
 
 ifeq ($(KBUILD_ENABLE_EXTRA_GCC_CHECKS),2)
@@ -315,7 +317,7 @@ cmd_dtc = mkdir -p $(dir ${dtc-tmp}) ; \
 	$(DTC) -q -O dtb -o $@ -b 0 \
 		$(addprefix -i,$(dir $<) $(DTC_INCLUDE)) $(DTC_FLAGS) \
                 -d $(depfile).dtc.tmp $(dtc-tmp) ; \
-        $(DTC) -O dts -I dtb -o $@.reverse.dts $@ ; \
+        $(DTC) -O dts -I dtb -o $@.reverse.dts $(DTC_FLAGS) $@ ; \
 	cat $(depfile).pre.tmp $(depfile).dtc.tmp > $(depfile)
 
 $(obj)/%.dtb: $(src)/%.dts FORCE
