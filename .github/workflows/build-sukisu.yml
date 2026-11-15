@@ -83,16 +83,10 @@ jobs:
           make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             gta4lve_eur_open_defconfig
 
-      - name: Install Clang 11.0.1
-        run: |
-          wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-11.0.1/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz
-          sudo tar -xf clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04.tar.xz -C /opt
-          echo "/opt/clang+llvm-11.0.1-x86_64-linux-gnu-ubuntu-20.04/bin" >> $GITHUB_PATH
-
       - name: Build kernel
         run: |
-          make ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- WT_BSP_BOARD_NAME=P15945AA1 \
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 \
             -j$(nproc) Image dtbs 2>&1 | tee build.log
 
       - name: Print errors to summary
