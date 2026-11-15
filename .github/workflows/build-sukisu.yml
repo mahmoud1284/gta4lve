@@ -109,6 +109,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
             echo "CONFIG_NOMOUNT=y"
+            echo "CONFIG_KPM=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KALLSYMS=y"
             echo "CONFIG_KALLSYMS_ALL=y"
@@ -137,12 +138,13 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
-          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_SUSFS|NOMOUNT|MODVERSIONS)=' .config
+          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
         run: |
           grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
           grep -q '^CONFIG_KSU=y$' .config
+          grep -q '^CONFIG_KPM=y$' .config
           grep -q '^CONFIG_MODVERSIONS=y$' .config
           ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
           echo "required configs present"
