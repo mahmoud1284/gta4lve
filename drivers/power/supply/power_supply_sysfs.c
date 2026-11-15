@@ -141,7 +141,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	ssize_t ret = 0;
 	struct power_supply *psy = dev_get_drvdata(dev);
 	const ptrdiff_t off = attr - power_supply_attrs;
-	union power_supply_propval value;
+	union power_supply_propval value = { 0 };
 
 	if (off == POWER_SUPPLY_PROP_TYPE) {
 		value.intval = psy->desc->type;
@@ -160,51 +160,114 @@ static ssize_t power_supply_show_property(struct device *dev,
 		}
 	}
 
-	if (off == POWER_SUPPLY_PROP_STATUS)
+	if (off == POWER_SUPPLY_PROP_STATUS) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_status_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_status_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_CHARGE_TYPE)
+	} else if (off == POWER_SUPPLY_PROP_CHARGE_TYPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_charge_type_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_charge_type_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_HEALTH)
+	} else if (off == POWER_SUPPLY_PROP_HEALTH) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_health_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_health_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_TECHNOLOGY)
+	} else if (off == POWER_SUPPLY_PROP_TECHNOLOGY) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_technology_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_technology_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_CAPACITY_LEVEL)
+	} else if (off == POWER_SUPPLY_PROP_CAPACITY_LEVEL) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_capacity_level_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_capacity_level_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_TYPE)
+	} else if (off == POWER_SUPPLY_PROP_TYPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_type_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_type_text[value.intval]);
-	else if (off == POWER_SUPPLY_PROP_USB_TYPE)
+	} else if (off == POWER_SUPPLY_PROP_USB_TYPE)
 		return power_supply_show_usb_type(dev, psy->desc->usb_types,
 						  psy->desc->num_usb_types,
 						  &value, buf);
-	else if (off == POWER_SUPPLY_PROP_SCOPE)
+	else if (off == POWER_SUPPLY_PROP_SCOPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_scope_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_scope_text[value.intval]);
 	//+ add real type char text by guoyanjun
-	else if (off == POWER_SUPPLY_PROP_CHARGE_REAL_TYPE)
+	else if (off == POWER_SUPPLY_PROP_CHARGE_REAL_TYPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_real_type_text)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_real_type_text[value.intval]);
 	//- add real type char text by guoyanjun
 	//+ Bug 699037,guoyanjun.wt,ADD,2021/12/06,Add charging information node
-	else if (off == POWER_SUPPLY_PROP_NEW_CHARGE_TYPE)
+	else if (off == POWER_SUPPLY_PROP_NEW_CHARGE_TYPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_new_charge_type)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_new_charge_type[value.intval]);
 	//- Bug 699037,guoyanjun.wt,ADD,2021/12/06,Add charging information node
 	//+ Bug  699041 ,guoyanjun.wt,ADD,2021/12/08,Add sys need node
-	else if (off == POWER_SUPPLY_PROP_OTG_TYPE)
+	else if (off == POWER_SUPPLY_PROP_OTG_TYPE) {
+		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_otg_type)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
 		return sprintf(buf, "%s\n",
 			       power_supply_otg_type[value.intval]);
 	//- Bug  699041 ,guoyanjun.wt,ADD,2021/12/08,Add sys need node
-	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME) {
+	} else if (off >= POWER_SUPPLY_PROP_MODEL_NAME) {
 		const char *strval = value.strval;
+		char probe_buf;
+		int probe_ret;
 
-		if (IS_ERR_OR_NULL(strval))
-			strval = "Unknown";
+		if (IS_ERR_OR_NULL(strval)) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
+
+		probe_ret = probe_kernel_read(&probe_buf, strval, 1);
+		if (probe_ret) {
+			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
+					   psy->desc->name, off, value.intval);
+			return sprintf(buf, "unknown\n");
+		}
+
 		return sprintf(buf, "%s\n", strval);
 	}
 
