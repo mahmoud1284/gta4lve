@@ -233,4 +233,19 @@
 		(*_d >> _to_shift) != _a);				\
 })
 
+
+#ifndef struct_size
+#define struct_size(p, member, n) \
+	(sizeof(*(p)) + sizeof(*(p)->member) * (n))
+#endif
+
+#ifndef array_size
+#define array_size(a, b) ({ \
+	size_t __a = (size_t)(a); \
+	size_t __b = (size_t)(b); \
+	size_t __r; \
+	__builtin_mul_overflow(__a, __b, &__r) ? (size_t)-1 : __r; \
+})
+#endif
+
 #endif /* __LINUX_OVERFLOW_H */

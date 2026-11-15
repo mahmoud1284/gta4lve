@@ -19,7 +19,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential bc bison flex libssl-dev libelf-dev \
+            build-essential bc bison flex libssl-dev libelf-dev libyaml-dev \
             gcc-aarch64-linux-gnu python3 git
 
       - name: Configure kernel

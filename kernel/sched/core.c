@@ -6441,8 +6441,10 @@ void __init sched_init(void)
 
 #ifdef CONFIG_SMP
 	/* May be allocated at isolcpus cmdline parse time */
+#ifdef CONFIG_CPUMASK_OFFSTACK
 	if (cpu_isolated_map == NULL)
 		zalloc_cpumask_var(&cpu_isolated_map, GFP_NOWAIT);
+#endif
 	idle_thread_set_boot_cpu();
 #endif
 	init_sched_fair_class();
