@@ -22,6 +22,21 @@ jobs:
             build-essential bc bison flex libssl-dev libelf-dev libyaml-dev \
             gcc-aarch64-linux-gnu python3 git patch curl
 
+      - name: Get toolchains (AOSP clang r383902 = clang 11.0.1)
+        run: |
+          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
+          ls clang-prebuilt | grep r383902
+          echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler (must be AOSP clang 11)
+        run: |
+          which clang
+          clang --version | head -1
+          clang --version | head -1 | grep -q "clang version 11"
+          ld.lld --version | head -1
+          aarch64-linux-gnu-ar --version | head -1
+          aarch64-linux-gnu-objdump --version | head -1
+
       - name: Integrate SukiSU Ultra (builtin)
         run: |
           set -euo pipefail
@@ -36,9 +51,13 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
-          cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
-          mkdir -p include/linux
-          cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
+          if [ -d /tmp/susfs4ksu/kernel_patches/fs ]; then
+            cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
+          fi
+          if [ -d /tmp/susfs4ksu/kernel_patches/include/linux ]; then
+            mkdir -p include/linux
+            cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
+          fi
           if [ -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch ]; then
             patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
           fi
@@ -49,7 +68,15 @@ jobs:
           set -euo pipefail
           git clone --depth 1 https://github.com/maxsteeel/nomount.git /tmp/nomount
           mkdir -p fs/nomount
-          cp -av /tmp/nomount/kernel/src/. fs/nomount/
+          if [ -d /tmp/nomount/kernel/src ]; then
+            cp -av /tmp/nomount/kernel/src/. fs/nomount/
+          elif [ -d /tmp/nomount/kernel/fs/nomount ]; then
+            cp -av /tmp/nomount/kernel/fs/nomount/. fs/nomount/
+          else
+            echo "NoMount kernel sources not found in expected paths"
+            find /tmp/nomount -maxdepth 3 -type f | sed 's/^/  /' || true
+            exit 1
+          fi
           grep -q "obj-\$(CONFIG_NOMOUNT)" fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
           if [ -f fs/nomount/Kconfig ]; then
             grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig || sed -i '/^endmenu/i\source "fs/nomount/Kconfig"' fs/Kconfig
@@ -60,9 +87,11 @@ jobs:
         run: |
           set -euo pipefail
           DEFCONFIG=arch/arm64/configs/gta4lve_eur_open_defconfig
-          # Keep stock vendor module compatibility and essential device drivers.
-          sed -i 's/^# CONFIG_CHARGER_BQ25890 is not set$/CONFIG_CHARGER_BQ25890=y/' "$DEFCONFIG" || true
-          sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG" || true
+          # Keep essential device drivers and stock vendor module compatibility.
+          sed -i 's/^# CONFIG_CHARGER_BQ25890 is not set$/CONFIG_CHARGER_BQ25890=y/' "$DEFCONFIG"
+          grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
+          sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG"
+          grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
           {
             echo ""
             echo "# SukiSU Ultra / SUSFS / NoMount"
@@ -81,90 +110,74 @@ jobs:
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KALLSYMS=y"
             echo "CONFIG_KALLSYMS_ALL=y"
-            echo "CONFIG_MODVERSIONS=y"
           } >> "$DEFCONFIG"
-          echo "Feature configs appended to $DEFCONFIG"
+          echo "Feature configs enabled"
 
       - name: Patch sources for clang 11
         run: |
           set -euo pipefail
-          # Skip GCC-only -fmerge-constants when building with clang to avoid -Werror failures.
-          if grep -q 'cc-option,-fmerge-constants' Makefile; then
-            sed -i -E 's|^(KBUILD_CFLAGS[[:space:]]+\+= )\$\(call cc-option,-fmerge-constants\)|\1$(if $(filter clang,$(cc-name)),,$(call cc-option,-fmerge-constants))|' Makefile
-          fi
-          # Remove bare -Werror tokens from vendor/kernel Makefiles that break on clang warnings.
-          grep -rlE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64 2>/dev/null \
+          # 1) -fmerge-constants is a GCC-only flag. Skip it for clang.
+          sed -i -E 's|^(KBUILD_CFLAGS[[:space:]]+\+= )\$\(call cc-option,-fmerge-constants\)|\1$(if $(filter clang,$(cc-name)),,$(call cc-option,-fmerge-constants))|' Makefile
+          grep -n "fmerge-constants" Makefile
+          grep -q 'filter clang,$(cc-name)' Makefile
+
+          # 2) Remove bare -Werror from vendor/kernel Makefiles so warnings do not break the build.
+          grep -rlE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64 \
             | xargs -r sed -i -E 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g'
-          if grep -rE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64 2>/dev/null; then
+          if grep -rE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64; then
             echo "bare -Werror still present"; exit 1
           fi
-          git diff --stat | tail -20 || true
-
-      - name: Get toolchains
-        run: |
-          set -euo pipefail
-          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
-          git clone --depth 1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc49
-          ls clang-prebuilt | grep r383902
-          echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
-          clang-prebuilt/clang-r383902/bin/clang --version | head -1
-
-      - name: Verify compiler
-        run: |
-          which clang
-          clang --version | head -1
-          ld.lld --version | head -1 || true
+          git diff --stat | tail -20
 
       - name: Configure kernel
         shell: bash
         run: |
-          set -euo pipefail
-          export PATH=$PWD/clang-prebuilt/clang-r383902/bin:$PATH
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=$PWD/gcc49/bin/aarch64-linux-android- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
-          echo "## Effective config" >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo '```'
-            grep -E '^CONFIG_(KSU|KSU_SUSFS|NOMOUNT|CHARGER_BQ25890|MODVERSIONS|JUMP_LABEL)=' .config || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_SUSFS|NOMOUNT|MODVERSIONS)=' .config
+
+      - name: Check required configs
+        run: |
+          grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
+          grep -q '^CONFIG_KSU=y$' .config
+          grep -q '^CONFIG_MODVERSIONS=y$' .config
+          ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
+          echo "required configs present"
 
       - name: Build kernel
         shell: bash
         run: |
-          set -euo pipefail
-          export PATH=$PWD/clang-prebuilt/clang-r383902/bin:$PATH
           make -k ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=$PWD/gcc49/bin/aarch64-linux-android- \
-            WT_BSP_BOARD_NAME=P15945AA1 -j"$(nproc)" Image dtbs 2>&1 | tee build.log
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 -j$(nproc) Image dtbs 2>&1 | tee build.log
           test -f arch/arm64/boot/Image
           ls -l arch/arm64/boot/Image
           strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
 
-      - name: Print build summary
+      - name: Print errors to summary
         if: always()
         run: |
           {
             echo "## Compiler"
             echo '```'
-            clang --version 2>/dev/null | head -1 || true
+            clang --version | head -1 || true
             echo '```'
             echo "## Build errors"
             echo '```'
-            grep -E "error:|\\*\\*\\* .*Error|No rule to make target|undefined reference|not found" build.log 2>/dev/null | head -80 || echo "none matched"
+            grep -E "error:|\*\*\* .*Error|No rule to make target|undefined reference|not found" build.log | head -80 || echo "none matched"
             echo '```'
-            echo "## Last 40 lines"
+            echo "## Last 40 lines of build.log"
             echo '```'
-            tail -n 40 build.log 2>/dev/null || true
+            tail -n 40 build.log || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload build logs
+      - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-sukisu-susfs-nomount
+          name: build-log-sukisu-susfs-nomount
           path: |
             build.log
             config.log
