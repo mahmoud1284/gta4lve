@@ -22,6 +22,21 @@ jobs:
             build-essential bc bison flex libssl-dev libelf-dev libyaml-dev \
             gcc-aarch64-linux-gnu python3 git curl
 
+      - name: Get toolchains (AOSP clang r383902 = clang 11.0.1)
+        run: |
+          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
+          ls clang-prebuilt | grep r383902
+          echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler (must be AOSP clang 11)
+        run: |
+          which clang
+          clang --version | head -1
+          clang --version | head -1 | grep -q "clang version 11"
+          ld.lld --version | head -1
+          aarch64-linux-gnu-ar --version | head -1
+          aarch64-linux-gnu-objdump --version | head -1
+
       - name: Integrate KernelSU
         run: |
           curl -LSs https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh | bash -s v0.9.5
@@ -40,27 +55,43 @@ jobs:
           } >> "$DEFCONFIG"
           echo "Feature configs enabled"
 
-      - name: Get toolchains
+      - name: Patch sources for clang 11
         run: |
-          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
-          ls clang-prebuilt | grep r383902
-          echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
-          clang-prebuilt/clang-r383902/bin/clang --version | head -1
+          # 1) -fmerge-constants is a GCC-only flag. clang only warns about it, but
+          #    vendor directories built with -Werror (sound/.../fs16xx) turn that
+          #    warning into a hard error. Skip the flag when the compiler is clang.
+          sed -i -E 's|^(KBUILD_CFLAGS[[:space:]]+\+= )\$\(call cc-option,-fmerge-constants\)|\1$(if $(filter clang,$(cc-name)),,$(call cc-option,-fmerge-constants))|' Makefile
+          grep -n "fmerge-constants" Makefile
+          grep -q 'filter clang,$(cc-name)' Makefile
+
+          # 2) Remove bare -Werror from vendor Makefiles so compiler-version
+          #    warnings do not break the build. Only the exact "-Werror" token is
+          #    touched; -Werror=<something> flags are left alone.
+          grep -rlE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64 \
+            | xargs -r sed -i -E 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g'
+          if grep -rE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64; then
+            echo "bare -Werror still present"; exit 1
+          fi
+          git diff --stat | tail -15
 
       - name: Configure kernel
         shell: bash
         run: |
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig
+            WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
 
       - name: Build kernel
         shell: bash
         run: |
-          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+          # shell: bash enables pipefail, so a failing make fails this step.
+          # -k keeps going after the first error so one run reports every error.
+          make -k ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 -j$(nproc) Image dtbs 2>&1 | tee build.log
           test -f arch/arm64/boot/Image
+          ls -l arch/arm64/boot/Image
+          strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
 
       - name: Print errors to summary
         if: always()
@@ -72,7 +103,7 @@ jobs:
             echo '```'
             echo "## Build errors"
             echo '```'
-            grep -E "error:|\*\*\* .*Error|No rule to make target|undefined reference|not found" build.log | head -40 || echo "none matched"
+            grep -E "error:|\*\*\* .*Error|No rule to make target|undefined reference|not found" build.log | head -60 || echo "none matched"
             echo '```'
             echo "## Last 40 lines of build.log"
             echo '```'
@@ -85,7 +116,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-kernelsu
-          path: build.log
+          path: |
+            build.log
+            config.log
           if-no-files-found: warn
 
       - name: Upload build artifacts
