@@ -42,8 +42,10 @@ jobs:
 
       - name: Get toolchains
         run: |
-          git clone --depth 1 -b android-12.0.0_r1 https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt || true
+          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
           git clone --depth 1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc49
+          ls clang-prebuilt | grep r383902
+          clang-prebuilt/clang-r383902/bin/clang --version | head -1
 
       - name: Configure kernel
         run: |
