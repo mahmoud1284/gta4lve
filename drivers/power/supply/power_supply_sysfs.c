@@ -13,6 +13,7 @@
 
 #include <linux/ctype.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/power_supply.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
@@ -199,8 +200,13 @@ static ssize_t power_supply_show_property(struct device *dev,
 		return sprintf(buf, "%s\n",
 			       power_supply_otg_type[value.intval]);
 	//- Bug  699041 ,guoyanjun.wt,ADD,2021/12/08,Add sys need node
-	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME)
-		return sprintf(buf, "%s\n", value.strval);
+	else if (off >= POWER_SUPPLY_PROP_MODEL_NAME) {
+		const char *strval = value.strval;
+
+		if (IS_ERR_OR_NULL(strval))
+			strval = "Unknown";
+		return sprintf(buf, "%s\n", strval);
+	}
 
 	if (off == POWER_SUPPLY_PROP_CHARGE_COUNTER_EXT)
 		return sprintf(buf, "%lld\n", value.int64val);
