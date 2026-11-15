@@ -165,7 +165,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	if (off == POWER_SUPPLY_PROP_STATUS) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_status_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -173,7 +173,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	} else if (off == POWER_SUPPLY_PROP_CHARGE_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_charge_type_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -181,7 +181,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	} else if (off == POWER_SUPPLY_PROP_HEALTH) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_health_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -189,7 +189,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	} else if (off == POWER_SUPPLY_PROP_TECHNOLOGY) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_technology_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -197,7 +197,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	} else if (off == POWER_SUPPLY_PROP_CAPACITY_LEVEL) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_capacity_level_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -205,7 +205,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	} else if (off == POWER_SUPPLY_PROP_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_type_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -217,7 +217,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	else if (off == POWER_SUPPLY_PROP_SCOPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_scope_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -227,7 +227,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	else if (off == POWER_SUPPLY_PROP_CHARGE_REAL_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_real_type_text)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -238,7 +238,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	else if (off == POWER_SUPPLY_PROP_NEW_CHARGE_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_new_charge_type)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -249,7 +249,7 @@ static ssize_t power_supply_show_property(struct device *dev,
 	else if (off == POWER_SUPPLY_PROP_OTG_TYPE) {
 		if (value.intval < 0 || value.intval >= (int)ARRAY_SIZE(power_supply_otg_type)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 		return sprintf(buf, "%s\n",
@@ -263,14 +263,14 @@ static ssize_t power_supply_show_property(struct device *dev,
 
 		if (IS_ERR_OR_NULL(strval)) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 
 		probe_ret = probe_kernel_read(&probe_buf, strval, 1);
 		if (probe_ret) {
 			pr_err_ratelimited("psy_sysfs: bad value psy=%s prop=%d intval=%d\n",
-					   psy->desc->name, off, value.intval);
+					   psy->desc->name, (int)off, value.intval);
 			return sprintf(buf, "unknown\n");
 		}
 
