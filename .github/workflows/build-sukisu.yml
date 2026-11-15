@@ -37,15 +37,16 @@ jobs:
           aarch64-linux-gnu-ar --version | head -1
           aarch64-linux-gnu-objdump --version | head -1
 
-      - name: Integrate SukiSU Ultra (builtin)
+      - name: Integrate SukiSU (builtin, Non-GKI compatible)
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
+          # Use a Non-GKI-focused SukiSU builtin fork for better 4.14 compatibility.
+          curl -LSs "https://raw.githubusercontent.com/xiziya/SukiSU_Non-GKI/builtin/kernel/setup.sh" | bash
           if [ ! -e drivers/kernelsu ]; then
             echo "SukiSU integration failed: drivers/kernelsu not found"
             exit 1
           fi
-          echo "SukiSU Ultra (builtin) integrated"
+          echo "SukiSU (builtin, Non-GKI compatible) integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
         run: |
@@ -59,7 +60,8 @@ jobs:
             cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
           fi
           if [ -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch ]; then
-            patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
+            # Apply kernel-side SUSFS patch; keep going on already-applied hunks but fail if patch binary fails unexpectedly.
+            patch -p1 --forward -r - --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
           fi
           echo "SUSFS integrated"
 
