@@ -1349,12 +1349,15 @@ static int sc27xx_fgu_get_status(struct sc27xx_fgu_data *data, int *status)
 		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val);
 		power_supply_put(psy);
 		if (ret)
-			return ret;
+			continue;
 
 		*status = val.intval;
+		return 0;
 	}
 
-	return ret;
+	/* No usable charger found; fall back to unknown instead of failing. */
+	*status = POWER_SUPPLY_STATUS_UNKNOWN;
+	return 0;
 }
 
 static int sc27xx_fgu_get_property(struct power_supply *psy,
