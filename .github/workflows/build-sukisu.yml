@@ -46,6 +46,32 @@ jobs:
             echo "SukiSU integration failed: drivers/kernelsu not found"
             exit 1
           fi
+          # 4.14 kernels use access_ok(type, addr, size); patch KPM calls if present.
+          if [ -f drivers/kernelsu/kpm/kpm.c ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path('drivers/kernelsu/kpm/kpm.c')
+          s = p.read_text()
+          # Convert common 2-arg access_ok(addr, size) forms to 3-arg for older kernels.
+          # Heuristic: read checks -> VERIFY_READ, write checks -> VERIFY_WRITE where obvious.
+          patterns = [
+              (r'access_ok\(\s*args\s*,', 'access_ok(VERIFY_READ, args,'),
+              (r'access_ok\(\s*arg2\s*,', 'access_ok(VERIFY_READ, arg2,'),
+              (r'access_ok\(\s*arg3\s*,', 'access_ok(VERIFY_READ, arg3,'),
+              (r'access_ok\(\s*arg4\s*,', 'access_ok(VERIFY_READ, arg4,'),
+              (r'access_ok\(\s*arg5\s*,', 'access_ok(VERIFY_READ, arg5,'),
+              (r'access_ok\(\s*out_info\s*,', 'access_ok(VERIFY_WRITE, out_info,'),
+              (r'access_ok\(\s*ctl_args\s*,', 'access_ok(VERIFY_READ, ctl_args,'),
+              (r'access_ok\(\s*buf\s*,', 'access_ok(VERIFY_WRITE, buf,'),
+          ]
+          for pat, rep in patterns:
+              s = re.sub(pat, rep, s)
+          # Generic fallback: access_ok(x, y) -> access_ok(VERIFY_READ, x, y) when only 2 args remain.
+          s = re.sub(r'access_ok\(\s*([^,\n]+?)\s*,\s*([^,\n]+?)\s*\)', lambda m: f'access_ok(VERIFY_READ, {m.group(1).strip()}, {m.group(2).strip()})' if m.group(0).count(',') == 1 else m.group(0), s)
+          p.write_text(s)
+          PY
+          fi
           echo "SukiSU (builtin, Non-GKI compatible) integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
@@ -60,8 +86,13 @@ jobs:
             cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
           fi
           if [ -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch ]; then
-            # Apply kernel-side SUSFS patch; keep going on already-applied hunks but fail if patch binary fails unexpectedly.
-            patch -p1 --forward -r - --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
+            # Apply kernel-side SUSFS patch. If it doesn't apply cleanly to this vendor tree,
+            # fail with visible rejects instead of silently continuing with a broken source state.
+            if ! patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch; then
+              echo "SUSFS kernel patch failed to apply cleanly."
+              find . -name '*.rej' -print || true
+              exit 1
+            fi
           fi
           echo "SUSFS integrated"
 
