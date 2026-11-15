@@ -43,30 +43,22 @@ jobs:
       - name: Get toolchains
         run: |
           git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
-          git clone --depth 1 https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 gcc49
           ls clang-prebuilt | grep r383902
           echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
-
-      - name: Verify compiler (must be AOSP clang 11)
-        run: |
-          which clang
-          clang --version | head -1
-          clang --version | head -1 | grep -q "clang version 11"
-          ld.lld --version | head -1
+          clang-prebuilt/clang-r383902/bin/clang --version | head -1
 
       - name: Configure kernel
         shell: bash
         run: |
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=$PWD/gcc49/bin/aarch64-linux-android- \
-            WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig
 
       - name: Build kernel
         shell: bash
         run: |
-          # shell: bash enables pipefail, so a failing make now fails this step
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=$PWD/gcc49/bin/aarch64-linux-android- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 -j$(nproc) Image dtbs 2>&1 | tee build.log
           test -f arch/arm64/boot/Image
 
@@ -93,9 +85,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log-kernelsu
-          path: |
-            build.log
-            config.log
+          path: build.log
           if-no-files-found: warn
 
       - name: Upload build artifacts
