@@ -51,6 +51,13 @@ jobs:
           # power_supply, so healthd finds no battery and Android never finishes booting.
           sed -i 's/^# CONFIG_CHARGER_BQ25890 is not set$/CONFIG_CHARGER_BQ25890=y/' "$DEFCONFIG"
           grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
+          # The stock Samsung vendor modules (mali_gondul.ko, sprd_camera.ko, ...) were built
+          # WITHOUT jump labels, so their expected CRC for module_layout is 0x68320676.
+          # With CONFIG_JUMP_LABEL=y this kernel produces 0x5d24e5b1, every vendor module is
+          # rejected ("disagrees about version of symbol module_layout"), the GPU driver never
+          # loads, surfaceflinger crash-loops and the device reboots after ~1 minute.
+          sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG"
+          grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
           {
             echo ""
             echo "# KernelSU"
@@ -93,6 +100,8 @@ jobs:
         run: |
           grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
           grep -q '^CONFIG_KSU=y$' .config
+          grep -q '^CONFIG_MODVERSIONS=y$' .config
+          ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
           echo "required configs present"
 
       - name: Build kernel
@@ -106,6 +115,40 @@ jobs:
           test -f arch/arm64/boot/Image
           ls -l arch/arm64/boot/Image
           strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
+
+      - name: Verify module CRCs against stock vendor modules
+        continue-on-error: true
+        shell: bash
+        run: |
+          # .github/vendor_crcs.txt = "symbol crc" pairs imported by the stock vendor
+          # modules (mali_gondul.ko + sprd_camera.ko). Every one must match this kernel.
+          test -f .github/vendor_crcs.txt || { echo "::warning::.github/vendor_crcs.txt missing, skipping CRC check"; exit 0; }
+          python3 - <<'PY'
+          import os, subprocess, sys
+          need = {}
+          for line in open(".github/vendor_crcs.txt"):
+              if line.strip():
+                  name, crc = line.split()
+                  need[name] = int(crc, 16)
+          out = subprocess.run(["llvm-nm", "vmlinux"], capture_output=True, text=True).stdout
+          have = {}
+          for line in out.splitlines():
+              p = line.split()
+              if len(p) == 3 and p[2].startswith("__crc_"):
+                  have[p[2][6:]] = int(p[0], 16)
+          bad = [(n, need[n], have.get(n)) for n in sorted(need) if have.get(n) != need[n]]
+          lines = ["## Vendor module CRC check",
+                   f"kernel exports {len(have)} CRCs, vendor modules need {len(need)}, mismatches: {len(bad)}"]
+          if not have:
+              lines.append("ERROR: no __crc_ symbols found in vmlinux (is CONFIG_MODVERSIONS on?)")
+          for n, want, got in bad[:60]:
+              lines.append(f"- {n}: vendor wants 0x{want:08x}, kernel has " + ("MISSING" if got is None else f"0x{got:08x}"))
+          lines.append(f"module_layout: vendor 0x{need.get('module_layout', 0):08x}, kernel 0x{have.get('module_layout', 0):08x}")
+          text = "\n".join(lines)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
+          sys.exit(1 if (bad or not have) else 0)
+          PY
 
       - name: Print errors to summary
         if: always()
