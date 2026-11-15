@@ -45,6 +45,12 @@ jobs:
       - name: Enable feature configs
         run: |
           DEFCONFIG=arch/arm64/configs/gta4lve_eur_open_defconfig
+          # The SGM41542 charger on this board is driven by bq25890_charger.c
+          # (it probes BQ25890 first, then falls back to SGM41542). Disabling
+          # CONFIG_CHARGER_BQ25890 removes the charger AND the "battery"
+          # power_supply, so healthd finds no battery and Android never finishes booting.
+          sed -i 's/^# CONFIG_CHARGER_BQ25890 is not set$/CONFIG_CHARGER_BQ25890=y/' "$DEFCONFIG"
+          grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
           {
             echo ""
             echo "# KernelSU"
@@ -80,6 +86,14 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
+          # fail early if the charger driver did not end up in the final .config
+          grep -E '^CONFIG_(CHARGER_BQ25890|CHARGER_MANAGER|KSU|MODVERSIONS)=' .config
+
+      - name: Check required configs
+        run: |
+          grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
+          grep -q '^CONFIG_KSU=y$' .config
+          echo "required configs present"
 
       - name: Build kernel
         shell: bash
