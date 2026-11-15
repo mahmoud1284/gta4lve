@@ -11,6 +11,7 @@
  *  You may use this code as per GPL version 2
  */
 
+#include <linux/bug.h>
 #include <linux/ctype.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -46,13 +47,13 @@ static const char * const power_supply_type_text[] = {
 	"Unknown", "Battery", "UPS", "Mains", "USB",
 	"USB_DCP", "USB_CDP", "USB_ACA", "USB_C",
 	"USB_PD", "USB_PD_DRP", "BrickID", "SFCP_1P0",
-	"SFCP_2P0", "Wireless"
+	"SFCP_2P0", "Wireless", "OTG"
 };
 
 static const char * const power_supply_usb_type_text[] = {
 	"Unknown", "SDP", "DCP", "CDP", "ACA", "C",
 	"PD", "PD_DRP", "PD_PPS", "BrickID", "SFCP_1P0",
-	"SFCP_2P0"
+	"SFCP_2P0", "AFC"
 };
 
 static const char * const power_supply_status_text[] = {
@@ -477,6 +478,15 @@ static const struct attribute_group *power_supply_attr_groups[] = {
 void power_supply_init_attrs(struct device_type *dev_type)
 {
 	int i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_type_text) != POWER_SUPPLY_TYPE_OTG + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_status_text) != POWER_SUPPLY_STATUS_FULL + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_charge_type_text) != POWER_SUPPLY_CHARGE_TYPE_FAST + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_health_text) != POWER_SUPPLY_HEALTH_HOT + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_technology_text) != POWER_SUPPLY_TECHNOLOGY_LiMn + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_capacity_level_text) != POWER_SUPPLY_CAPACITY_LEVEL_FULL + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_scope_text) != POWER_SUPPLY_SCOPE_DEVICE + 1);
+	BUILD_BUG_ON(ARRAY_SIZE(power_supply_usb_type_text) != POWER_SUPPLY_USB_TYPE_AFC + 1);
 
 	dev_type->groups = power_supply_attr_groups;
 
