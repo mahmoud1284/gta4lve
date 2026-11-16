@@ -134,8 +134,9 @@ jobs:
           # fs/namespace.c: ensure susfs top-level defs required by susfs 1.5.5 patches
           p = Path('fs/namespace.c')
           s = p.read_text()
-          if 'susfs_mnt_id_ida' not in s:
-              s = s.replace('#include <linux/fslog.h>\n', '#include <linux/fslog.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
+          if 'DEFINE_IDA(susfs_mnt_id_ida)' not in s:
+              if '#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif' not in s:
+                  s = s.replace('#include <linux/fslog.h>\n', '#include <linux/fslog.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
               block = '\n'
               block += '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
               block += 'extern bool susfs_is_current_ksu_domain(void);\n'
@@ -163,6 +164,8 @@ jobs:
               block += 'extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);\n'
               block += 'bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;\n'
               block += '#endif\n'
+              if '#include "internal.h"\n' not in s:
+                  raise SystemExit('namespace.c internal.h include not found')
               s = s.replace('#include "internal.h"\n', '#include "internal.h"\n' + block + '\n', 1)
               p.write_text(s)
 
@@ -210,7 +213,7 @@ jobs:
 
           # Fail fast if expected SUSFS fixups are missing.
           checks = [
-              ('fs/namespace.c', 'susfs_mnt_id_ida'),
+              ('fs/namespace.c', 'DEFINE_IDA(susfs_mnt_id_ida)'),
               ('fs/proc/task_mmu.c', 'CONFIG_KSU_SUSFS_SUS_KSTAT'),
           ]
           for path, marker in checks:
@@ -345,8 +348,8 @@ jobs:
                   raise SystemExit(f'2-arg access_ok still present in {kpm_path}')
           if 'CMD_SUSFS_ADD_SUS_PATH_LOOP' in Path('drivers/kernelsu/supercall/dispatch.c').read_text():
               raise SystemExit('Unsupported SUSFS command still present in dispatch.c')
-          if 'susfs_mnt_id_ida' not in Path('fs/namespace.c').read_text():
-              raise SystemExit('susfs_mnt_id_ida missing from fs/namespace.c')
+          if 'DEFINE_IDA(susfs_mnt_id_ida)' not in Path('fs/namespace.c').read_text():
+              raise SystemExit('susfs_mnt_id_ida definition missing from fs/namespace.c')
           PYTHON
 
       - name: Enable feature configs
