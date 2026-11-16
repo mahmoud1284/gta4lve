@@ -63,7 +63,8 @@ jobs:
               p = Path(path)
               if not p.exists():
                   return
-              s = p.read_text()
+              orig = p.read_text()
+              s = orig
               # Common 4.14 KPM case with nested call in first arg.
               s = re.sub(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(\s*cmd\.result_code\s*\)\s*,\s*sizeof\(\s*result\s*\)\s*\)',
                          'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))', s)
@@ -79,9 +80,9 @@ jobs:
                   write_like = a in ('out_info', 'buf', 'res', 'ctl_args') or b.endswith('out_sz') or b.endswith('buf_sz')
                   t = 'VERIFY_WRITE' if write_like else 'VERIFY_READ'
                   return f'access_ok({t}, {a}, {b})'
-              ns = re.sub(r'\baccess_ok\s*\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)', repl, s)
-              if ns != s:
-                  p.write_text(ns)
+              s = re.sub(r'\baccess_ok\s*\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)', repl, s)
+              if s != orig:
+                  p.write_text(s)
 
           for kpm_path in ['drivers/kernelsu/kpm/kpm.c', 'drivers/kernelsu/extension/kpm/kpm.c']:
               fix_access_ok(kpm_path)
