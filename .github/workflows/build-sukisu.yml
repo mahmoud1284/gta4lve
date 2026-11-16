@@ -353,6 +353,11 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
+          # Re-assert these symbols after defconfig. This kernel tree has several
+          # vendor config layers; scripts/config makes the intended final state explicit.
+          scripts/config --file .config --enable I2C --enable GPIOLIB --enable CHARGER_BQ25890
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- olddefconfig 2>&1 | tee -a config.log
           grep -E '^CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
