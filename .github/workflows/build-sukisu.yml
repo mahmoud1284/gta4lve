@@ -363,19 +363,27 @@ jobs:
 
       - name: Check required configs
         run: |
-          if ! grep -q '^CONFIG_CHARGER_BQ25890=y$' .config; then
-            echo '::error::CONFIG_CHARGER_BQ25890 was dropped by Kconfig'
-            grep -E '^(# )?CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|COMPILE_TEST)' .config || true
-            grep -n -A8 -B3 'config CHARGER_BQ25890' drivers/power/supply/Kconfig || true
+          missing=0
+          for sym in CHARGER_BQ25890 I2C GPIOLIB KSU KSU_MANUAL_SU KSU_SUSFS NOMOUNT KPM MODVERSIONS; do
+            state=$(scripts/config --state "$sym" 2>/dev/null || true)
+            if [ "$state" != y ]; then
+              echo "::error::missing CONFIG_${sym}=y (state=${state:-undefined})"
+              missing=1
+            else
+              echo "CONFIG_${sym}=y"
+            fi
+          done
+          if grep -q '^CONFIG_JUMP_LABEL=y$' .config; then
+            echo '::error::CONFIG_JUMP_LABEL must be disabled for vendor module compatibility'
+            missing=1
+          else
+            echo 'CONFIG_JUMP_LABEL is disabled'
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo '--- relevant .config state ---'
+            grep -E '^(# )?CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS|JUMP_LABEL)' .config || true
             exit 1
           fi
-          grep -q '^CONFIG_KSU=y$' .config
-          grep -q '^CONFIG_KSU_MANUAL_SU=y$' .config
-          grep -q '^CONFIG_KSU_SUSFS=y$' .config
-          grep -q '^CONFIG_NOMOUNT=y$' .config
-          grep -q '^CONFIG_KPM=y$' .config
-          grep -q '^CONFIG_MODVERSIONS=y$' .config
-          ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
           echo "required configs present"
 
       - name: Prepare kernel build
