@@ -88,6 +88,25 @@ jobs:
           set -euo pipefail
           rm -rf /tmp/susfs4ksu
           git clone --depth 1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+          # The SUSFS repository keeps its KernelSU Kconfig additions in a separate
+          # patch. Apply only that Kconfig menu; the patch's legacy KernelSU Makefile
+          # edits are not compatible with Nova and are intentionally not applied.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          patch = Path('/tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch').read_text()
+          lines = patch.splitlines()
+          start = next(i for i, line in enumerate(lines) if line == '+menu "KernelSU - SUSFS"')
+          end = next(i for i in range(start + 1, len(lines)) if lines[i] == '+endmenu')
+          block = '\n'.join(line[1:] for line in lines[start:end + 1]) + '\n\n'
+          kconfig = Path('KernelSU/kernel/Kconfig')
+          text = kconfig.read_text()
+          if 'config KSU_SUSFS\n' not in text:
+              marker = 'config KSU_MANUAL_SU\n'
+              assert text.count(marker) == 1, 'Nova KSU_MANUAL_SU marker not found uniquely'
+              kconfig.write_text(text.replace(marker, block + marker, 1))
+          assert 'config KSU_SUSFS\n' in kconfig.read_text()
+          PYTHON
+          grep -q '^config KSU_SUSFS$' KernelSU/kernel/Kconfig
           cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
           mkdir -p include/linux
           cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
