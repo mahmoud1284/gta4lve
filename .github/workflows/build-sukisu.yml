@@ -1,4 +1,4 @@
-name: Build Kernel (SukiSU Ultra + SUSFS + NoMount + KPM)
+name: Build Kernel (SukiSU Nova + SUSFS + NoMount + KPM)
 
 on:
   push:
@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    name: Build kernel with SukiSU Ultra, SUSFS, NoMount and KPM
+    name: Build kernel with SukiSU Nova, SUSFS, NoMount and KPM
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -42,15 +42,16 @@ jobs:
           aarch64-linux-gnu-ar --version | head -1
           aarch64-linux-gnu-objdump --version | head -1
 
-      # SukiSU is pinned to the April-2025 builtin commit: it is the last generation
-      # that speaks the SUSFS 1.5.5 API (the only SUSFS that exists for kernel 4.14)
-      # and that uses plain manual hooks. Newer SukiSU needs SUSFS 2.x.
-      - name: Integrate SukiSU Ultra (builtin, pinned)
+      # Pin the exact latest Nova commit known when this workflow was authored.
+      # Do not use a moving branch in a kernel build.
+      - name: Integrate SukiSU Nova (pinned)
         run: |
           set -euo pipefail
-          git clone --filter=blob:none -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
-          git -C KernelSU checkout 1a563bb3e167d9550a06c55aeff11080e675a1b4
-          git -C KernelSU log -1 --format='SukiSU commit %h %ad %s' --date=short | tee -a "$GITHUB_STEP_SUMMARY"
+          NOVA_COMMIT=c60f21b9e00e35e898f8d21e0612465b76b9beec
+          git clone --filter=blob:none https://github.com/SukiSU-Nova/SukiSU-Nova.git KernelSU
+          git -C KernelSU checkout "$NOVA_COMMIT"
+          test "$(git -C KernelSU rev-parse HEAD)" = "$NOVA_COMMIT"
+          git -C KernelSU log -1 --format='SukiSU Nova commit %H %ad %s' --date=short | tee -a "$GITHUB_STEP_SUMMARY"
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
           if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
@@ -58,9 +59,9 @@ jobs:
                  END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"drivers/kernelsu/Kconfig\""; print l[i] } }' \
               drivers/Kconfig > drivers/Kconfig.tmp && mv drivers/Kconfig.tmp drivers/Kconfig
           fi
-          # KPM: task_struct has no thread_pid before 4.19
-          sed -i 's/^    DEFINE_MEMBER(task_struct, thread_pid)$/#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n    DEFINE_MEMBER(task_struct, thread_pid)\n#endif/' KernelSU/kernel/kpm/super_access.c
-          grep -q 'KERNEL_VERSION(4, 19, 0)' KernelSU/kernel/kpm/super_access.c
+          # Nova's KPM already selects the correct task_struct member for 4.14.
+          grep -q 'KERNEL_VERSION(4, 19, 0)' KernelSU/kernel/extension/kpm/super_access.c
+          grep -q 'pids\[PIDTYPE_PID\]\.pid' KernelSU/kernel/extension/kpm/super_access.c
           # SukiSU's Makefile injects get_cred_rcu() into include/linux/cred.h while it is
           # being parsed, *after* it already decided the helper is missing -> the first build
           # would define it twice. Inject it ourselves, before any build.
@@ -78,7 +79,9 @@ jobs:
           PYTHON
           fi
           grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h
-          echo "SukiSU Ultra integrated"
+          grep -q 'REPO_OWNER  := SukiSU-Nova' KernelSU/kernel/Kbuild
+          grep -q 'CONFIG_KSU_MANUAL_SU' KernelSU/kernel/Kconfig
+          echo "SukiSU Nova integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
         run: |
@@ -220,140 +223,17 @@ jobs:
           test -f fs/susfs.c && test -f include/linux/susfs.h && test -f include/linux/susfs_def.h
           echo "SUSFS integrated"
 
-      # SUSFS 1.5.5 does not contain the KernelSU hooks; without them root never works.
-      - name: Add KernelSU manual hooks (exec / faccessat / stat / read / input / devpts)
+      # Nova wires its syscall/event hooks internally; do not inject the
+      # obsolete Ultra manual-hook API (ksu_handle_*).
+      - name: Verify Nova native hook architecture
         run: |
           set -euo pipefail
-          python3 - <<'PYTHON'
-          import re, sys
-          from pathlib import Path
-
-          def edit(path, fn):
-              p = Path(path)
-              s = p.read_text()
-              if 'CONFIG_KSU' in s and 'ksu_handle_' in s:
-                  print(f'{path}: already hooked'); return
-              n = fn(s)
-              if n == s:
-                  sys.exit(f'::error::hook anchor not found in {path}')
-              p.write_text(n)
-              print(f'{path}: hooked')
-
-          def sub1(s, pat, repl, flags=re.S):
-              n, c = re.subn(pat, repl, s, count=1, flags=flags)
-              if c != 1:
-                  sys.exit(f'::error::anchor not found: {pat[:50]}')
-              return n
-
-          G = '#ifdef CONFIG_KSU\n'
-          E = '#endif\n'
-
-          # fs/exec.c : one hook in do_execveat_common (covers execve/execveat/compat)
-          def exec_c(s):
-              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern bool ksu_execveat_hook __read_mostly;
-          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
-          			       void *envp, int *flags);
-          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
-          					void *argv, void *envp, int *flags);
-          #endif
-          ''')
-              return sub1(s, r'(static int do_execveat_common\(int fd, struct filename \*filename,.*?\tint retval;\n)(\n\tif \(IS_ERR\(filename\)\))',
-                  r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	if (unlikely(ksu_execveat_hook))
-          		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
-          	else
-          		ksu_handle_execveat_sucompat(&fd, &filename, NULL, NULL, NULL);
-          #endif
-          \2''')
-          edit('fs/exec.c', exec_c)
-
-          # fs/open.c : faccessat
-          def open_c(s):
-              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
-          				int *flags);
-          #endif
-          ''')
-              return sub1(s, r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n(?:\t[^\n]*;\n)+)(\n\tif \(mode & ~S_IRWXO\))',
-                  r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
-          #endif
-          \2''')
-          edit('fs/open.c', open_c)
-
-          # fs/read_write.c : read (installs the init.rc hook)
-          def rw_c(s):
-              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern bool ksu_vfs_read_hook __read_mostly;
-          extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
-          #endif
-          ''')
-              return sub1(s, r'(SYSCALL_DEFINE3\(read, unsigned int, fd, char __user \*, buf, size_t, count\)\n\{\n)(\tstruct fd f = fdget_pos\(fd\);\n\tssize_t ret = -EBADF;\n)',
-                  r'''\1\2
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	if (unlikely(ksu_vfs_read_hook))
-          		ksu_handle_sys_read(fd, &buf, &count);
-          #endif
-          ''')
-          edit('fs/read_write.c', rw_c)
-
-          # fs/stat.c : vfs_statx covers stat/lstat/newfstatat/statx
-          def stat_c(s):
-              s = sub1(s, r'(\nint vfs_statx\(int dfd, const char __user \*filename, int flags,)',
-                  r'''
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
-          #endif
-          \1''')
-              return sub1(s, r'(int vfs_statx\(int dfd, const char __user \*filename, int flags,\n[^\n]*\)\n\{\n(?:\t[^\n]*;\n)+)',
-                  r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	ksu_handle_stat(&dfd, &filename, &flags);
-          #endif
-          ''')
-          edit('fs/stat.c', stat_c)
-
-          # drivers/input/input.c : volume-key safe mode
-          def input_c(s):
-              s = sub1(s, r'(\nvoid input_event\(struct input_dev \*dev,)', r'''
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern bool ksu_input_hook __read_mostly;
-          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
-          #endif
-          \1''')
-              return sub1(s, r'(void input_event\(struct input_dev \*dev,\n\t\t unsigned int type, unsigned int code, int value\)\n\{\n\tunsigned long flags;\n)',
-                  r'''\1
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	if (unlikely(ksu_input_hook))
-          		ksu_handle_input_handle_event(&type, &code, &value);
-          #endif
-          ''')
-          edit('drivers/input/input.c', input_c)
-
-          # fs/devpts/inode.c : su shell pty labelling
-          def devpts_c(s):
-              s = sub1(s, r'(\n/\*\*\n \* devpts_get_priv -- get private data for a slave)', r'''
-          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          extern int ksu_handle_devpts(struct inode *inode);
-          #endif
-          \1''')
-              return sub1(s, r'(void \*devpts_get_priv\(struct dentry \*dentry\)\n\{\n)', r'''\1#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
-          	ksu_handle_devpts(dentry->d_inode);
-          #endif
-          ''')
-          edit('fs/devpts/inode.c', devpts_c)
-
-          PYTHON
-          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c fs/devpts/inode.c drivers/input/input.c; do
-            grep -q 'ksu_handle_\|ksu_execveat_hook\|ksu_vfs_read_hook\|ksu_input_hook' "$f" || { echo "::error::hook missing in $f"; exit 1; }
-          done
-          echo "KernelSU hooks present"
+          test -f KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_execve_common' KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_faccessat' KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_newfstatat' KernelSU/kernel/hook/syscall_event_bridge.c
+          ! grep -q 'CONFIG_KSU_MANUAL_HOOK' KernelSU/kernel/Kconfig
+          echo "Nova native hooks verified"
 
       # SUSFS appends fields to task_struct and vfsmount. That changes the genksyms CRC of
       # ~150 exported symbols (module_layout, fput, dev_err, ...) so the stock vendor
@@ -407,11 +287,10 @@ jobs:
           grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
           {
             echo ""
-            echo "# SukiSU Ultra / SUSFS 1.5.5 / NoMount / KPM"
+            echo "# SukiSU Nova / SUSFS 1.5.5 / NoMount / KPM"
             echo "CONFIG_KSU=y"
-            # SukiSU's Kconfig wrongly marks every kernel as GKI (string compare on VERSION),
-            # which would select kprobe hooks. We use manual hooks instead.
-            echo "CONFIG_KSU_MANUAL_HOOK=y"
+            # Nova uses its native syscall/event hook implementation.
+            echo "CONFIG_KSU_MANUAL_SU=y"
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -425,7 +304,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
-            # sus_su is kprobe-only in this SukiSU generation and breaks manual-hook builds
+            # Keep the legacy SUSFS su hook disabled; Nova supplies its own hook path.
             echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
             echo "CONFIG_NOMOUNT=y"
             echo "CONFIG_KPM=y"
@@ -472,14 +351,13 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
-          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_MANUAL_HOOK|KSU_HOOK_KPROBES|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
+          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
         run: |
           grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
           grep -q '^CONFIG_KSU=y$' .config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' .config
-          ! grep -q '^CONFIG_KSU_HOOK_KPROBES=y$' .config
+          grep -q '^CONFIG_KSU_MANUAL_SU=y$' .config
           grep -q '^CONFIG_KSU_SUSFS=y$' .config
           grep -q '^CONFIG_NOMOUNT=y$' .config
           grep -q '^CONFIG_KPM=y$' .config
@@ -520,7 +398,6 @@ jobs:
           strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
 
       - name: Verify module CRCs against stock vendor modules
-        continue-on-error: true
         shell: bash
         run: |
           # SUSFS adds fields to task_struct/inode. If that changes the CRC of a symbol
