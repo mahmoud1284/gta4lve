@@ -469,6 +469,21 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 prepare
 
+      # SukiSU's Makefile backports path_umount()/can_umount() into fs/namespace.c while
+      # it is parsed. With a parallel build fs/namespace.o can be compiled before that
+      # happens -> "undefined symbol: path_umount" at link time. Run the injection first.
+      - name: Apply SukiSU compat edits before the real build
+        shell: bash
+        run: |
+          set -euo pipefail
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 drivers/kernelsu/ksu.o 2>&1 | tee compat.log
+          grep -q '^int path_umount' fs/namespace.c
+          grep -q '^static int can_umount' fs/namespace.c
+          grep -q 'int path_umount' fs/internal.h
+          echo "compat edits applied"
+
       - name: Build kernel
         shell: bash
         run: |
@@ -546,6 +561,7 @@ jobs:
             build.log
             config.log
             susfs_patch.log
+            compat.log
           if-no-files-found: warn
 
       - name: Upload build artifacts
