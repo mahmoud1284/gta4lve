@@ -94,6 +94,7 @@ jobs:
       - name: Integrate SUSFS (kernel-4.14)
         run: |
           set -euo pipefail
+          rm -rf /tmp/susfs4ksu
           git clone --depth 1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
           if [ -d /tmp/susfs4ksu/kernel_patches/fs ]; then
             cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
@@ -223,6 +224,7 @@ jobs:
       - name: Integrate NoMount
         run: |
           set -euo pipefail
+          rm -rf /tmp/nomount
           git clone --depth 1 https://github.com/maxsteeel/nomount.git /tmp/nomount
           mkdir -p fs/nomount
           if [ -d /tmp/nomount/kernel/src ]; then
