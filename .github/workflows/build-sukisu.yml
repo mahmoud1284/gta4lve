@@ -65,8 +65,8 @@ jobs:
                   return
               s = p.read_text()
               # Common 4.14 KPM case with nested call in first arg.
-              s = s.replace('access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))',
-                            'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))')
+              s = re.sub(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(\s*cmd\.result_code\s*\)\s*,\s*sizeof\(\s*result\s*\)\s*\)',
+                         'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))', s)
               def repl(m):
                   inner = m.group(1).strip()
                   if inner.count(',') != 1:
@@ -336,12 +336,10 @@ jobs:
               path.write_text(s)
 
           # Final sanity checks for common failure points.
-          for kpm_path in ['drivers/kernelsu/kpm/kpm.c', 'drivers/kernelsu/extension/kpm/kpm.c']:
-              p = Path(kpm_path)
-              if p.exists():
-                  s = p.read_text()
-                  if re.search(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(cmd\.result_code\)\s*,\s*sizeof\(result\)\s*\)', s):
-                      raise SystemExit(f'2-arg access_ok still present in {kpm_path}')
+          for kpm_path in Path('drivers/kernelsu').rglob('*.c'):
+              s = kpm_path.read_text()
+              if re.search(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(\s*cmd\.result_code\s*\)\s*,\s*sizeof\(\s*result\s*\)\s*\)', s):
+                  raise SystemExit(f'2-arg access_ok still present in {kpm_path}')
           if 'CMD_SUSFS_ADD_SUS_PATH_LOOP' in Path('drivers/kernelsu/supercall/dispatch.c').read_text():
               raise SystemExit('Unsupported SUSFS command still present in dispatch.c')
           if 'susfs_mnt_id_ida' not in Path('fs/namespace.c').read_text():
