@@ -121,14 +121,17 @@ jobs:
                             '#include <linux/uaccess.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
               p.write_text(s)
 
-          # fs/proc/task_mmu.c: ensure sus_kstat include
+          # fs/proc/task_mmu.c: ensure sus_kstat include/defs
           p = Path('fs/proc/task_mmu.c')
           s = p.read_text()
-          if 'CONFIG_KSU_SUSFS_SUS_KSTAT' not in s:
+          if 'CONFIG_KSU_SUSFS_SUS_KSTAT' in s and '#include <linux/susfs_def.h>' not in s:
+              inc = '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n'
               if '#include <linux/ctype.h>\n' in s:
-                  s = s.replace('#include <linux/ctype.h>\n', '#include <linux/ctype.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)
+                  s = s.replace('#include <linux/ctype.h>\n', '#include <linux/ctype.h>\n' + inc, 1)
+              elif '#include <linux/mm_inline.h>\n' in s:
+                  s = s.replace('#include <linux/mm_inline.h>\n', '#include <linux/mm_inline.h>\n' + inc, 1)
               else:
-                  s = s.replace('#include <linux/mm_inline.h>\n', '#include <linux/mm_inline.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)
+                  s = '#include <linux/susfs_def.h>\n' + s
               p.write_text(s)
 
           # fs/namespace.c: ensure susfs top-level defs required by susfs 1.5.5 patches
@@ -220,6 +223,9 @@ jobs:
               txt = Path(path).read_text()
               if marker not in txt:
                   raise SystemExit(f'Missing expected SUSFS marker {marker} in {path}')
+          task_mmu = Path('fs/proc/task_mmu.c').read_text()
+          if 'INODE_STATE_SUS_KSTAT' in task_mmu and '#include <linux/susfs_def.h>' not in task_mmu:
+              raise SystemExit('susfs_def.h include missing from fs/proc/task_mmu.c')
           print('SUSFS integrated with conflict fixups')
           PYTHON
           echo "SUSFS integrated"
