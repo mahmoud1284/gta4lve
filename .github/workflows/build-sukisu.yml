@@ -358,6 +358,151 @@ jobs:
               raise SystemExit('susfs_mnt_id_ida definition missing from fs/namespace.c')
           PYTHON
 
+          # SukiSU Ultra (builtin, newer SUSFS integration API) vs susfs4ksu 1.5.5 kernel-4.14 compat.
+          # Provide missing SUSFS helper symbols and fix 4.14-missing kernel APIs used by SukiSU.
+          python3 - <<'PYTHON'
+          import re
+          from pathlib import Path
+
+          # sulog/event.c: raw strncpy_from_user_nofault -> ksu wrapper (4.14 compat path)
+          p = Path('KernelSU/kernel/sulog/event.c')
+          if p.exists():
+              s = p.read_text()
+              s = s.replace(
+                  'strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));',
+                  'ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));'
+              )
+              p.write_text(s)
+
+          # kernel_compat.h: make ksu_strncpy_from_user_nofault header-safe and ensure uaccess include
+          p = Path('KernelSU/kernel/kernel_compat.h')
+          if p.exists():
+              s = p.read_text()
+              if '#include <linux/uaccess.h>' not in s:
+                  s = s.replace('#include <linux/version.h>\n', '#include <linux/version.h>\n#include <linux/uaccess.h>\n', 1)
+              s = s.replace(
+                  '\nlong ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)\n{',
+                  '\nstatic inline long ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)\n{'
+              )
+              p.write_text(s)
+
+          # supercall/dispatch.c: kvcalloc is unavailable on 4.14
+          p = Path('KernelSU/kernel/supercall/dispatch.c')
+          if p.exists():
+              s = p.read_text()
+              if '#include <linux/mm.h>' not in s:
+                  s = s.replace('#include <linux/kernel.h>\n', '#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/slab.h>\n', 1)
+              s = s.replace('names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);',
+                            'names = kvmalloc_array(cmd.count, sizeof(*names), GFP_KERNEL | __GFP_ZERO);')
+              s = s.replace('addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);',
+                            'addrs = kvmalloc_array(cmd.count, sizeof(*addrs), GFP_KERNEL | __GFP_ZERO);')
+              s = s.replace('kfree(names);', 'kvfree(names);')
+              s = s.replace('kfree(addrs);', 'kvfree(addrs);')
+              p.write_text(s)
+
+          # adb_root.c: declare compat helpers when SUSFS path is used
+          p = Path('KernelSU/kernel/feature/adb_root.c')
+          if p.exists():
+              s = p.read_text()
+              needle = '#ifdef CONFIG_KSU_SUSFS\nstatic inline long is_exec_adbd(const char *filename)\n{'
+              decls = '#ifdef CONFIG_KSU_SUSFS\nextern bool susfs_starts_with(const char *str, const char *prefix);\nextern bool susfs_ends_with(const char *str, const char *suffix);\nstatic inline long is_exec_adbd(const char *filename)\n{'
+              if needle in s and 'extern bool susfs_starts_with' not in s:
+                  s = s.replace(needle, decls)
+                  p.write_text(s)
+
+          # lsm_hook.c: ensure workqueue types are available for susfs_extra_works usage
+          p = Path('KernelSU/kernel/hook/lsm_hook.c')
+          if p.exists():
+              s = p.read_text()
+              if 'extern struct work_struct susfs_extra_works;' in s and '#include <linux/workqueue.h>' not in s:
+                  s = s.replace('#include <linux/cred.h>\n', '#include <linux/cred.h>\n#include <linux/workqueue.h>\n', 1)
+                  p.write_text(s)
+
+          compat_c = r'''#include <linux/types.h>
+          #include <linux/string.h>
+          #include <linux/cred.h>
+          #include <linux/sched.h>
+          #include <linux/workqueue.h>
+          #include <linux/slab.h>
+          #include <linux/mm.h>
+          #include <linux/uaccess.h>
+          #include "kernel_compat.h"
+          
+          #ifdef CONFIG_KSU_SUSFS
+          #include <linux/susfs.h>
+          #include <linux/susfs_def.h>
+          
+          bool susfs_starts_with(const char *str, const char *prefix)
+          {
+          	size_t len;
+          
+          	if (!str || !prefix)
+          		return false;
+          	len = strlen(prefix);
+          	return strncmp(str, prefix, len) == 0;
+          }
+          
+          bool susfs_ends_with(const char *str, const char *suffix)
+          {
+          	size_t str_len, suffix_len;
+          
+          	if (!str || !suffix)
+          		return false;
+          	str_len = strlen(str);
+          	suffix_len = strlen(suffix);
+          	if (suffix_len > str_len)
+          		return false;
+          	return memcmp(str + str_len - suffix_len, suffix, suffix_len) == 0;
+          }
+          
+          void susfs_set_current_proc_no_su(void) {}
+          void susfs_set_current_proc_umounted(void) {}
+          void susfs_set_current_proc_umounted_for_zygote_next(void) {}
+          
+          static void susfs_extra_works_fn(struct work_struct *work) {}
+          DECLARE_WORK(susfs_extra_works, susfs_extra_works_fn);
+          
+          void susfs_parse_priority_app_strings(void) {}
+          void susfs_start_sdcard_monitor_fn(void) {}
+          
+          int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)
+          {
+          	return 0;
+          }
+          
+          #ifndef KSU_HAS_STRNCPY_FROM_USER_NOFAULT
+          long strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
+          {
+          	return ksu_strncpy_from_user_nofault(dst, unsafe_addr, count);
+          }
+          #endif
+          
+          #endif /* CONFIG_KSU_SUSFS */
+          '''
+          Path('KernelSU/kernel/susfs_compat_155.c').write_text(compat_c)
+          
+          mk = Path('KernelSU/kernel/Makefile')
+          if mk.exists():
+              s = mk.read_text()
+              if 'susfs_compat_155.o' not in s_mk:
+                  s_mk += '\nifeq ($(CONFIG_KSU_SUSFS), y)\nksu-y += susfs_compat_155.o\nendif\n'
+                  mk.write_text(s_mk)
+          
+          # sanity checks for reported link errors
+          p = Path('KernelSU/kernel/sulog/event.c')
+          if p.exists():
+              txt = p.read_text()
+              if 'strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));' in txt:
+                  raise SystemExit('raw strncpy_from_user_nofault still present in sulog/event.c')
+          p = Path('KernelSU/kernel/supercall/dispatch.c')
+          if p.exists() and 'kvcalloc(' in p.read_text():
+              raise SystemExit('kvcalloc still present in supercall/dispatch.c')
+          if not Path('KernelSU/kernel/susfs_compat_155.c').exists():
+              raise SystemExit('susfs_compat_155.c missing')
+          print('SukiSU/SUSFS 1.5.5 compat shims applied')
+          PYTHON
+          echo "4.14 SukiSU/SUSFS compatibility fixes applied"
+
       - name: Enable feature configs
         run: |
           set -euo pipefail
