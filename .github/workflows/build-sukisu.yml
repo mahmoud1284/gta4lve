@@ -64,14 +64,22 @@ jobs:
               if not p.exists():
                   return
               s = p.read_text()
+              # Common 4.14 KPM case with nested call in first arg.
+              s = s.replace('access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))',
+                            'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))')
               def repl(m):
-                  a, b = m.group(1).strip(), m.group(2).strip()
+                  inner = m.group(1).strip()
+                  if inner.count(',') != 1:
+                      return m.group(0)
+                  a, b = [x.strip() for x in inner.split(',', 1)]
                   if a in ('VERIFY_READ', 'VERIFY_WRITE'):
+                      return m.group(0)
+                  if '(' in a or ')' in a:
                       return m.group(0)
                   write_like = a in ('out_info', 'buf', 'res', 'ctl_args') or b.endswith('out_sz') or b.endswith('buf_sz')
                   t = 'VERIFY_WRITE' if write_like else 'VERIFY_READ'
                   return f'access_ok({t}, {a}, {b})'
-              ns = re.sub(r'\baccess_ok\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)', repl, s)
+              ns = re.sub(r'\baccess_ok\s*\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)', repl, s)
               if ns != s:
                   p.write_text(ns)
 
