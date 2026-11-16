@@ -281,7 +281,9 @@ jobs:
           set -euo pipefail
           DEFCONFIG=arch/arm64/configs/gta4lve_eur_open_defconfig
           # Keep essential device drivers and stock vendor module compatibility.
-          sed -i 's/^# CONFIG_CHARGER_BQ25890 is not set$/CONFIG_CHARGER_BQ25890=y/' "$DEFCONFIG"
+          # Remove every previous spelling first, then add exactly one canonical value.
+          sed -i '/^CONFIG_CHARGER_BQ25890=/d; /^# CONFIG_CHARGER_BQ25890 is not set$/d' "$DEFCONFIG"
+          printf '\nCONFIG_CHARGER_BQ25890=y\n' >> "$DEFCONFIG"
           grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
           sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG"
           grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
@@ -351,11 +353,16 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
-          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
+          grep -E '^CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
         run: |
-          grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
+          if ! grep -q '^CONFIG_CHARGER_BQ25890=y$' .config; then
+            echo '::error::CONFIG_CHARGER_BQ25890 was dropped by Kconfig'
+            grep -E '^(# )?CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|COMPILE_TEST)' .config || true
+            grep -n -A8 -B3 'config CHARGER_BQ25890' drivers/power/supply/Kconfig || true
+            exit 1
+          fi
           grep -q '^CONFIG_KSU=y$' .config
           grep -q '^CONFIG_KSU_MANUAL_SU=y$' .config
           grep -q '^CONFIG_KSU_SUSFS=y$' .config
