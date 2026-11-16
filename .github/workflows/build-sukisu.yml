@@ -355,6 +355,31 @@ jobs:
           done
           echo "KernelSU hooks present"
 
+      # SUSFS appends fields to task_struct and vfsmount. That changes the genksyms CRC of
+      # ~150 exported symbols (module_layout, fput, dev_err, ...) so the stock vendor
+      # modules (mali_gondul, sprd_camera) are rejected and the tablet bootloops.
+      # Hiding the fields from genksyms keeps every CRC identical to the stock kernel.
+      - name: Keep vendor module CRCs stable (hide SUSFS fields from genksyms)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          # Fields SUSFS appends to exported structs change genksyms CRCs of ~150 symbols and make the
+          # stock vendor modules (mali_gondul, sprd_camera) fail to load. Hide them from genksyms only:
+          # the compiler still sees them, the CRCs stay identical to the stock kernel.
+          for path, field in (('include/linux/sched.h', '\tu64 susfs_task_state;\n\tu64 susfs_last_fake_mnt_id;\n'),
+                              ('include/linux/mount.h', '\tu64 susfs_mnt_id_backup;\n')):
+              p = Path(path); s = p.read_text()
+              old = '#ifdef CONFIG_KSU_SUSFS\n' + field + '#endif\n'
+              new = '#ifdef CONFIG_KSU_SUSFS\n#ifndef __GENKSYMS__\n' + field + '#endif\n#endif\n'
+              if new in s:
+                  continue
+              assert s.count(old) == 1, 'SUSFS struct field block not found in ' + path
+              p.write_text(s.replace(old, new))
+              print('genksyms-hidden:', path)
+          PYTHON
+          grep -n -B1 -A3 '__GENKSYMS__' include/linux/sched.h include/linux/mount.h
+
       - name: Integrate NoMount
         run: |
           set -euo pipefail
