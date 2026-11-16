@@ -1,4 +1,4 @@
-name: Build Kernel (SukiSU Ultra + SUSFS + NoMount)
+name: Build Kernel (SukiSU Ultra + SUSFS + NoMount + KPM)
 
 on:
   push:
@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      bypass_module_crc:
+        description: "Let the kernel load vendor modules even if their symbol CRCs differ (use only if the CRC check step reports mismatches)"
+        type: boolean
+        default: false
 
 jobs:
   build:
-    name: Build kernel with SukiSU Ultra, SUSFS and NoMount
+    name: Build kernel with SukiSU Ultra, SUSFS, NoMount and KPM
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source
@@ -37,79 +42,62 @@ jobs:
           aarch64-linux-gnu-ar --version | head -1
           aarch64-linux-gnu-objdump --version | head -1
 
-      - name: Integrate SukiSU Ultra (builtin)
+      # SukiSU is pinned to the April-2025 builtin commit: it is the last generation
+      # that speaks the SUSFS 1.5.5 API (the only SUSFS that exists for kernel 4.14)
+      # and that uses plain manual hooks. Newer SukiSU needs SUSFS 2.x.
+      - name: Integrate SukiSU Ultra (builtin, pinned)
         run: |
           set -euo pipefail
-          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
-          if [ ! -e drivers/kernelsu ]; then
-            echo "SukiSU Ultra integration failed: drivers/kernelsu not found"
-            exit 1
+          git clone --filter=blob:none -b builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          git -C KernelSU checkout 1a563bb3e167d9550a06c55aeff11080e675a1b4
+          git -C KernelSU log -1 --format='SukiSU commit %h %ad %s' --date=short | tee -a "$GITHUB_STEP_SUMMARY"
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
+            awk '/^endmenu/ { last = NR } { l[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"drivers/kernelsu/Kconfig\""; print l[i] } }' \
+              drivers/Kconfig > drivers/Kconfig.tmp && mv drivers/Kconfig.tmp drivers/Kconfig
           fi
-          echo "SukiSU Ultra commit: $(git -C KernelSU rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
-
-          python3 - <<'PYTHON'
+          # KPM: task_struct has no thread_pid before 4.19
+          sed -i 's/^    DEFINE_MEMBER(task_struct, thread_pid)$/#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n    DEFINE_MEMBER(task_struct, thread_pid)\n#endif/' KernelSU/kernel/kpm/super_access.c
+          grep -q 'KERNEL_VERSION(4, 19, 0)' KernelSU/kernel/kpm/super_access.c
+          # SukiSU's Makefile injects get_cred_rcu() into include/linux/cred.h while it is
+          # being parsed, *after* it already decided the helper is missing -> the first build
+          # would define it twice. Inject it ourselves, before any build.
+          if ! grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h; then
+            python3 - <<'PYTHON'
           from pathlib import Path
-          import re
-
-          # 4.14 compat: static_call.h is unavailable
-          p = Path('drivers/kernelsu/kernel_includes.h')
-          if p.exists():
-              s = p.read_text()
-              s = s.replace('#include <linux/static_call.h>\n',
-                            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)\n#include <linux/static_call.h>\n#endif\n')
-              p.write_text(s)
-
-          # 4.14 compat: KPM uses 2-arg access_ok in newer code; kernel 4.14 expects 3 args.
-          def fix_access_ok(path):
-              p = Path(path)
-              if not p.exists():
-                  return
-              orig = p.read_text()
-              s = orig
-              # Common 4.14 KPM case with nested call in first arg.
-              s = re.sub(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(\s*cmd\.result_code\s*\)\s*,\s*sizeof\(\s*result\s*\)\s*\)',
-                         'access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))', s)
-              def repl(m):
-                  inner = m.group(1).strip()
-                  if inner.count(',') != 1:
-                      return m.group(0)
-                  a, b = [x.strip() for x in inner.split(',', 1)]
-                  if a in ('VERIFY_READ', 'VERIFY_WRITE'):
-                      return m.group(0)
-                  if '(' in a or ')' in a:
-                      return m.group(0)
-                  write_like = a in ('out_info', 'buf', 'res', 'ctl_args') or b.endswith('out_sz') or b.endswith('buf_sz')
-                  t = 'VERIFY_WRITE' if write_like else 'VERIFY_READ'
-                  return f'access_ok({t}, {a}, {b})'
-              s = re.sub(r'\baccess_ok\s*\(([^()\n]*(?:\([^()\n]*\)[^()\n]*)*)\)', repl, s)
-              if s != orig:
-                  p.write_text(s)
-
-          for kpm_path in ['drivers/kernelsu/kpm/kpm.c', 'drivers/kernelsu/extension/kpm/kpm.c']:
-              fix_access_ok(kpm_path)
-          for kpm_path in Path('drivers/kernelsu').rglob('kpm*.c'):
-              fix_access_ok(str(kpm_path))
+          p = Path('include/linux/cred.h'); s = p.read_text()
+          fn = ('static inline const struct cred *get_cred_rcu(const struct cred *cred)\n'
+                '{\n\tstruct cred *nonconst_cred = (struct cred *) cred;\n\tif (!cred)\n\t\treturn NULL;\n'
+                '\tif (!atomic_inc_not_zero(&nonconst_cred->usage))\n\t\treturn NULL;\n'
+                '\tvalidate_creds(cred);\n\treturn cred;\n}\n\n')
+          key = 'static inline void put_cred'
+          assert s.count(key) == 1
+          p.write_text(s.replace(key, fn + key))
           PYTHON
-          echo "SukiSU Ultra (builtin) integrated"
+          fi
+          grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h
+          echo "SukiSU Ultra integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
         run: |
           set -euo pipefail
           rm -rf /tmp/susfs4ksu
           git clone --depth 1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
-          if [ -d /tmp/susfs4ksu/kernel_patches/fs ]; then
-            cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
-          fi
-          if [ -d /tmp/susfs4ksu/kernel_patches/include/linux ]; then
-            mkdir -p include/linux
-            cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
-          fi
-          if [ -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch ]; then
-            # Apply kernel-side SUSFS patch. This vendor 4.14.190 tree has known context conflicts;
-            # apply with rejects and resolve the expected conflicts below.
-            patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch 2>&1 | tee susfs_patch.log || true
-          fi
-
+          cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
+          mkdir -p include/linux
+          cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
+          # drop the stale 3-line susfs_def.h include left in fs/namei.c by an earlier attempt
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('fs/namei.c'); s = p.read_text()
+          s = s.replace('#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n', '')
+          p.write_text(s)
+          PYTHON
+          # The patch has 5 known-conflicting header/include hunks on this vendor tree;
+          # they are re-applied by the script below. Everything else must apply.
+          patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch 2>&1 | tee susfs_patch.log || true
           python3 - <<'PYTHON'
           from pathlib import Path
           import re
@@ -229,298 +217,159 @@ jobs:
               raise SystemExit('susfs_def.h include missing from fs/proc/task_mmu.c')
           print('SUSFS integrated with conflict fixups')
           PYTHON
-
-          # SUSFS builtin mode relies on inline hooks inside the kernel patch. If they
-          # are missing the kernel still builds but root silently never works.
-          test -f fs/susfs.c
-          test -f include/linux/susfs.h
-          test -f include/linux/susfs_def.h
-          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c; do
-            if grep -q 'ksu_handle_\|susfs_' "$f"; then
-              echo "hook ok: $f"
-            else
-              echo "::error::no KernelSU/SUSFS hook found in $f (SUSFS patch hunk did not apply)"
-              exit 1
-            fi
-          done
+          test -f fs/susfs.c && test -f include/linux/susfs.h && test -f include/linux/susfs_def.h
           echo "SUSFS integrated"
+
+      # SUSFS 1.5.5 does not contain the KernelSU hooks; without them root never works.
+      - name: Add KernelSU manual hooks (exec / faccessat / stat / read / input / devpts)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import re, sys
+          from pathlib import Path
+
+          def edit(path, fn):
+              p = Path(path)
+              s = p.read_text()
+              if 'CONFIG_KSU' in s and 'ksu_handle_' in s:
+                  print(f'{path}: already hooked'); return
+              n = fn(s)
+              if n == s:
+                  sys.exit(f'::error::hook anchor not found in {path}')
+              p.write_text(n)
+              print(f'{path}: hooked')
+
+          def sub1(s, pat, repl, flags=re.S):
+              n, c = re.subn(pat, repl, s, count=1, flags=flags)
+              if c != 1:
+                  sys.exit(f'::error::anchor not found: {pat[:50]}')
+              return n
+
+          G = '#ifdef CONFIG_KSU\n'
+          E = '#endif\n'
+
+          # fs/exec.c : one hook in do_execveat_common (covers execve/execveat/compat)
+          def exec_c(s):
+              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern bool ksu_execveat_hook __read_mostly;
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,
+          			       void *envp, int *flags);
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
+          					void *argv, void *envp, int *flags);
+          #endif
+          ''')
+              return sub1(s, r'(static int do_execveat_common\(int fd, struct filename \*filename,.*?\tint retval;\n)(\n\tif \(IS_ERR\(filename\)\))',
+                  r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	if (unlikely(ksu_execveat_hook))
+          		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+          	else
+          		ksu_handle_execveat_sucompat(&fd, &filename, NULL, NULL, NULL);
+          #endif
+          \2''')
+          edit('fs/exec.c', exec_c)
+
+          # fs/open.c : faccessat
+          def open_c(s):
+              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
+          				int *flags);
+          #endif
+          ''')
+              return sub1(s, r'(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n\{\n(?:\t[^\n]*;\n)+)(\n\tif \(mode & ~S_IRWXO\))',
+                  r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          \2''')
+          edit('fs/open.c', open_c)
+
+          # fs/read_write.c : read (installs the init.rc hook)
+          def rw_c(s):
+              s = sub1(s, r'(#include "internal\.h"\n)', r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern int ksu_handle_sys_read(unsigned int fd, char __user **buf_ptr, size_t *count_ptr);
+          #endif
+          ''')
+              return sub1(s, r'(SYSCALL_DEFINE3\(read, unsigned int, fd, char __user \*, buf, size_t, count\)\n\{\n)(\tstruct fd f = fdget_pos\(fd\);\n\tssize_t ret = -EBADF;\n)',
+                  r'''\1\2
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	if (unlikely(ksu_vfs_read_hook))
+          		ksu_handle_sys_read(fd, &buf, &count);
+          #endif
+          ''')
+          edit('fs/read_write.c', rw_c)
+
+          # fs/stat.c : vfs_statx covers stat/lstat/newfstatat/statx
+          def stat_c(s):
+              s = sub1(s, r'(\nint vfs_statx\(int dfd, const char __user \*filename, int flags,)',
+                  r'''
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          #endif
+          \1''')
+              return sub1(s, r'(int vfs_statx\(int dfd, const char __user \*filename, int flags,\n[^\n]*\)\n\{\n(?:\t[^\n]*;\n)+)',
+                  r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	ksu_handle_stat(&dfd, &filename, &flags);
+          #endif
+          ''')
+          edit('fs/stat.c', stat_c)
+
+          # drivers/input/input.c : volume-key safe mode
+          def input_c(s):
+              s = sub1(s, r'(\nvoid input_event\(struct input_dev \*dev,)', r'''
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern bool ksu_input_hook __read_mostly;
+          extern int ksu_handle_input_handle_event(unsigned int *type, unsigned int *code, int *value);
+          #endif
+          \1''')
+              return sub1(s, r'(void input_event\(struct input_dev \*dev,\n\t\t unsigned int type, unsigned int code, int value\)\n\{\n\tunsigned long flags;\n)',
+                  r'''\1
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	if (unlikely(ksu_input_hook))
+          		ksu_handle_input_handle_event(&type, &code, &value);
+          #endif
+          ''')
+          edit('drivers/input/input.c', input_c)
+
+          # fs/devpts/inode.c : su shell pty labelling
+          def devpts_c(s):
+              s = sub1(s, r'(\n/\*\*\n \* devpts_get_priv -- get private data for a slave)', r'''
+          #if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          extern int ksu_handle_devpts(struct inode *inode);
+          #endif
+          \1''')
+              return sub1(s, r'(void \*devpts_get_priv\(struct dentry \*dentry\)\n\{\n)', r'''\1#if defined(CONFIG_KSU) && !defined(CONFIG_KSU_HOOK_KPROBES)
+          	ksu_handle_devpts(dentry->d_inode);
+          #endif
+          ''')
+          edit('fs/devpts/inode.c', devpts_c)
+
+          PYTHON
+          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c fs/devpts/inode.c drivers/input/input.c; do
+            grep -q 'ksu_handle_\|ksu_execveat_hook\|ksu_vfs_read_hook\|ksu_input_hook' "$f" || { echo "::error::hook missing in $f"; exit 1; }
+          done
+          echo "KernelSU hooks present"
 
       - name: Integrate NoMount
         run: |
           set -euo pipefail
           rm -rf /tmp/nomount
-          git clone --depth 1 https://github.com/maxsteeel/nomount.git /tmp/nomount
+          git clone https://github.com/maxsteeel/nomount.git /tmp/nomount
+          git -C /tmp/nomount checkout 7914458ca71dfa3a8c162fa97fdb69332db7a690
           mkdir -p fs/nomount
-          if [ -d /tmp/nomount/kernel/src ]; then
-            cp -av /tmp/nomount/kernel/src/. fs/nomount/
-          elif [ -d /tmp/nomount/kernel/fs/nomount ]; then
-            cp -av /tmp/nomount/kernel/fs/nomount/. fs/nomount/
-          else
-            echo "NoMount kernel sources not found in expected paths"
-            find /tmp/nomount -maxdepth 3 -type f | sed 's/^/  /' || true
-            exit 1
-          fi
-          grep -q "obj-\$(CONFIG_NOMOUNT)" fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
-          if [ -f fs/nomount/Kconfig ]; then
-            if ! grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
-              awk '/^endmenu/ { last = NR } { l[NR] = $0 }
-                   END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print l[i] } }' \
-                fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
-            fi
+          cp -av /tmp/nomount/kernel/src/. fs/nomount/
+          grep -q 'CONFIG_NOMOUNT' fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          if ! grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+            awk '/^endmenu/ { last = NR } { l[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print l[i] } }' \
+              fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
           fi
           echo "NoMount integrated"
-
-      - name: Apply 4.14 SukiSU/SUSFS compatibility fixes
-        run: |
-          set -euo pipefail
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          import re
-
-          def patch_text(path, replacer):
-              p = Path(path)
-              if not p.exists():
-                  return
-              s = p.read_text()
-              ns = replacer(s)
-              if ns != s:
-                  p.write_text(ns)
-
-          # Ensure SUSFS 1.5.5 headers provide flags/defs expected by patched kernel code.
-          def fix_susfs_def(s):
-              if 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' not in s:
-                  s += '\n#ifndef TASK_STRUCT_NON_ROOT_USER_APP_PROC\n#define TASK_STRUCT_NON_ROOT_USER_APP_PROC BIT(24)\n#endif\n'
-              if 'INODE_STATE_SUS_KSTAT' not in s:
-                  s += '\n#ifndef INODE_STATE_SUS_KSTAT\n#define INODE_STATE_SUS_KSTAT BIT(26)\n#endif\n'
-              if 'CL_COPY_MNT_NS' not in s:
-                  s += '\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS BIT(25)\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS BIT(24)\n#endif\n'
-              return s
-          patch_text('include/linux/susfs_def.h', fix_susfs_def)
-
-          # Bridge SukiSU Ultra's modern SUSFS supercall usage to susfs4ksu 1.5.5 kernel APIs.
-          def fix_dispatch(s):
-              s = s.replace('if (magic2 == SUSFS_MAGIC && current_uid().val == 0) {', 'if (current_uid().val == 0) {')
-              repls = [
-                  (r'susfs_add_sus_path\(arg\);', 'susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);'),
-                  (r'susfs_add_sus_path_loop\(arg\);', 'susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);'),
-                  (r'susfs_add_sus_kstat\(arg\);', 'susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);'),
-                  (r'susfs_update_sus_kstat\(arg\);', 'susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);'),
-                  (r'susfs_set_uname\(arg\);', 'susfs_set_uname((struct st_susfs_uname __user *)*arg);'),
-                  (r'susfs_add_open_redirect\(arg\);', 'susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*arg);'),
-                  (r'susfs_set_cmdline_or_bootconfig\(arg\);', 'susfs_set_cmdline_or_bootconfig((char __user *)*arg);'),
-                  (r'susfs_enable_log\(arg\);', 'susfs_set_log((bool)(unsigned long)*arg);'),
-              ]
-              for pat, rep in repls:
-                  s = re.sub(pat, rep, s)
-
-              # Remove/replace v2-only commands not present in 1.5.5.
-              removals = [
-                  r'\s*case CMD_SUSFS_ADD_SUS_PATH_LOOP:\s*\n\s*susfs_add_sus_path_loop\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:\s*\n\s*susfs_set_hide_sus_mnts_for_non_su_procs\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_ADD_SUS_MAP:\s*\n\s*susfs_add_sus_map\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:\s*\n\s*susfs_set_avc_log_spoofing\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_SHOW_ENABLED_FEATURES:\s*\n\s*susfs_get_enabled_features\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_SET_PRIORITY_UID_FILTER:\s*\n\s*susfs_set_priority_uid_filter\(.*?\);\s*\n\s*return 0;',
-                  r'\s*case CMD_SUSFS_AVC_LOG_SPOOFING:\s*\n\s*susfs_set_avc_log_spoofing\(.*?\);\s*\n\s*return 0;',
-              ]
-              for pat in removals:
-                  s = re.sub(pat, '\n            /* not supported by susfs4ksu 1.5.5 */', s, flags=re.S)
-
-              s = re.sub(r'case CMD_SUSFS_SHOW_VARIANT:\s*\n\s*susfs_show_variant\(.*?\);\s*\n\s*return 0;',
-                         'case CMD_SUSFS_SHOW_VARIANT:\n            return 0;', s)
-              s = re.sub(r'case CMD_SUSFS_SHOW_VERSION:\s*\n\s*susfs_show_version\(.*?\);\s*\n\s*return 0;',
-                         'case CMD_SUSFS_SHOW_VERSION:\n            return 0;', s)
-
-              # Catch-all: drop any remaining unsupported SUSFS command cases/calls cleanly.
-              s = re.sub(r'\n\s*case CMD_SUSFS_[A-Z0-9_]+:\s*\n\s*[^\n]*susfs_[a-z0-9_]*\([^;]*\);\s*\n\s*return 0;',
-                         '\n            /* unsupported SUSFS command for 1.5.5 */', s)
-
-              # Add 1.5.5 mount/try_umount commands when missing.
-              if 'CMD_SUSFS_ADD_SUS_MOUNT' not in s and 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
-                  s = s.replace('#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
-                                '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n        case CMD_SUSFS_ADD_SUS_MOUNT:\n            susfs_add_sus_mount((struct st_susfs_sus_mount __user *)*arg);\n            return 0;', 1)
-              if 'CMD_SUSFS_ADD_TRY_UMOUNT' not in s and 'CONFIG_KSU_SUSFS_TRY_UMOUNT' in s:
-                  s = s.replace('#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT',
-                                '#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\n        case CMD_SUSFS_ADD_TRY_UMOUNT:\n            susfs_add_try_umount((struct st_susfs_try_umount __user *)*arg);\n            return 0;\n        case CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS:\n            susfs_try_umount(current_uid().val);\n            return 0;', 1)
-
-              # Ensure 1.5.5 command IDs are available when SukiSU headers don't define them.
-              if 'CMD_SUSFS_ADD_SUS_MOUNT' in s and '#ifndef CMD_SUSFS_ADD_SUS_MOUNT' not in s:
-                  s = s.replace('#include <linux/susfs_def.h>', '#include <linux/susfs_def.h>\n#ifndef CMD_SUSFS_ADD_SUS_MOUNT\n#define CMD_SUSFS_ADD_SUS_MOUNT 0x55560\n#endif\n#ifndef CMD_SUSFS_ADD_TRY_UMOUNT\n#define CMD_SUSFS_ADD_TRY_UMOUNT 0x55580\n#endif\n#ifndef CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS\n#define CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS 0x555d0\n#endif', 1)
-              return s
-          patch_text('drivers/kernelsu/supercall/dispatch.c', fix_dispatch)
-
-          # Avoid hard dependency on v2-only susfs helpers in other SukiSU code when building with 1.5.5.
-          for path in Path('drivers/kernelsu').rglob('*.c'):
-              sp = str(path)
-              if sp.endswith('supercall/dispatch.c'):
-                  continue
-              s = path.read_text()
-              if 'susfs_get_enabled_features(' in s:
-                  s = s.replace('susfs_get_enabled_features(', '(0 /* compat 1.5.5 */)')
-                  path.write_text(s)
-
-          # Guard SUSFS extension code that expects newer susfs kernel symbols/APIs.
-          for path in Path('drivers/kernelsu').rglob('susfs_extension.c'):
-              s = path.read_text()
-              s = re.sub(r'\bsusfs_show_variant\s*\([^)]*\)', '0', s)
-              s = re.sub(r'\bsusfs_show_version\s*\([^)]*\)', '0', s)
-              path.write_text(s)
-
-          # Final sanity checks for common failure points.
-          for kpm_path in Path('drivers/kernelsu').rglob('*.c'):
-              s = kpm_path.read_text()
-              if re.search(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(\s*cmd\.result_code\s*\)\s*,\s*sizeof\(\s*result\s*\)\s*\)', s):
-                  raise SystemExit(f'2-arg access_ok still present in {kpm_path}')
-          if 'CMD_SUSFS_ADD_SUS_PATH_LOOP' in Path('drivers/kernelsu/supercall/dispatch.c').read_text():
-              raise SystemExit('Unsupported SUSFS command still present in dispatch.c')
-          if 'DEFINE_IDA(susfs_mnt_id_ida)' not in Path('fs/namespace.c').read_text():
-              raise SystemExit('susfs_mnt_id_ida definition missing from fs/namespace.c')
-          PYTHON
-
-          # SukiSU Ultra (builtin, newer SUSFS integration API) vs susfs4ksu 1.5.5 kernel-4.14 compat.
-          # Provide missing SUSFS helper symbols and fix 4.14-missing kernel APIs used by SukiSU.
-          python3 - <<'PYTHON'
-          import re
-          from pathlib import Path
-
-          # sulog/event.c: raw strncpy_from_user_nofault -> ksu wrapper (4.14 compat path)
-          p = Path('KernelSU/kernel/sulog/event.c')
-          if p.exists():
-              s = p.read_text()
-              if 'strncpy_from_user_nofault(' in s:
-                  # replace raw calls but avoid double-prefixing wrapper calls
-                  s = re.sub(r'(?<!ksu_)\bstrncpy_from_user_nofault\s*\(', 'ksu_strncpy_from_user_nofault(', s)
-                  s = s.replace('ksu_ksu_strncpy_from_user_nofault(', 'ksu_strncpy_from_user_nofault(')
-                  p.write_text(s)
-
-          # kernel_compat.h: make ksu_strncpy_from_user_nofault header-safe and ensure uaccess include
-          p = Path('KernelSU/kernel/kernel_compat.h')
-          if p.exists():
-              s = p.read_text()
-              if '#include <linux/uaccess.h>' not in s:
-                  s = s.replace('#include <linux/version.h>\n', '#include <linux/version.h>\n#include <linux/uaccess.h>\n', 1)
-              s = s.replace(
-                  '\nlong ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)\n{',
-                  '\nstatic inline long ksu_strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)\n{'
-              )
-              p.write_text(s)
-
-          # supercall/dispatch.c: kvcalloc is unavailable on 4.14
-          p = Path('KernelSU/kernel/supercall/dispatch.c')
-          if p.exists():
-              s = p.read_text()
-              if '#include <linux/mm.h>' not in s:
-                  s = s.replace('#include <linux/kernel.h>\n', '#include <linux/kernel.h>\n#include <linux/mm.h>\n#include <linux/slab.h>\n', 1)
-              s = s.replace('names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);',
-                            'names = kvmalloc_array(cmd.count, sizeof(*names), GFP_KERNEL | __GFP_ZERO);')
-              s = s.replace('addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);',
-                            'addrs = kvmalloc_array(cmd.count, sizeof(*addrs), GFP_KERNEL | __GFP_ZERO);')
-              s = s.replace('kfree(names);', 'kvfree(names);')
-              s = s.replace('kfree(addrs);', 'kvfree(addrs);')
-              p.write_text(s)
-
-          # adb_root.c: declare compat helpers when SUSFS path is used
-          p = Path('KernelSU/kernel/feature/adb_root.c')
-          if p.exists():
-              s = p.read_text()
-              needle = '#ifdef CONFIG_KSU_SUSFS\nstatic inline long is_exec_adbd(const char *filename)\n{'
-              decls = '#ifdef CONFIG_KSU_SUSFS\nextern bool susfs_starts_with(const char *str, const char *prefix);\nextern bool susfs_ends_with(const char *str, const char *suffix);\nstatic inline long is_exec_adbd(const char *filename)\n{'
-              if needle in s and 'extern bool susfs_starts_with' not in s:
-                  s = s.replace(needle, decls)
-                  p.write_text(s)
-
-          # lsm_hook.c: ensure workqueue types are available for susfs_extra_works usage
-          p = Path('KernelSU/kernel/hook/lsm_hook.c')
-          if p.exists():
-              s = p.read_text()
-              if 'extern struct work_struct susfs_extra_works;' in s and '#include <linux/workqueue.h>' not in s:
-                  s = s.replace('#include <linux/cred.h>\n', '#include <linux/cred.h>\n#include <linux/workqueue.h>\n', 1)
-                  p.write_text(s)
-
-          compat_c = r'''#include <linux/types.h>
-          #include <linux/string.h>
-          #include <linux/cred.h>
-          #include <linux/sched.h>
-          #include <linux/workqueue.h>
-          #include <linux/slab.h>
-          #include <linux/mm.h>
-          #include <linux/uaccess.h>
-          #include "kernel_compat.h"
-          
-          #ifdef CONFIG_KSU_SUSFS
-          #include <linux/susfs.h>
-          #include <linux/susfs_def.h>
-          
-          bool susfs_starts_with(const char *str, const char *prefix)
-          {
-          	size_t len;
-          
-          	if (!str || !prefix)
-          		return false;
-          	len = strlen(prefix);
-          	return strncmp(str, prefix, len) == 0;
-          }
-          
-          bool susfs_ends_with(const char *str, const char *suffix)
-          {
-          	size_t str_len, suffix_len;
-          
-          	if (!str || !suffix)
-          		return false;
-          	str_len = strlen(str);
-          	suffix_len = strlen(suffix);
-          	if (suffix_len > str_len)
-          		return false;
-          	return memcmp(str + str_len - suffix_len, suffix, suffix_len) == 0;
-          }
-          
-          void susfs_set_current_proc_no_su(void) {}
-          void susfs_set_current_proc_umounted(void) {}
-          void susfs_set_current_proc_umounted_for_zygote_next(void) {}
-          
-          static void susfs_extra_works_fn(struct work_struct *work) {}
-          DECLARE_WORK(susfs_extra_works, susfs_extra_works_fn);
-          
-          void susfs_parse_priority_app_strings(void) {}
-          void susfs_start_sdcard_monitor_fn(void) {}
-          
-          int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u16 type, u32 orig_avd_allowed)
-          {
-          	return 0;
-          }
-          
-          #ifndef KSU_HAS_STRNCPY_FROM_USER_NOFAULT
-          long strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
-          {
-          	return ksu_strncpy_from_user_nofault(dst, unsafe_addr, count);
-          }
-          #endif
-          
-          #endif /* CONFIG_KSU_SUSFS */
-          '''
-          Path('KernelSU/kernel/susfs_compat_155.c').write_text(compat_c)
-          
-          mk = Path('KernelSU/kernel/Makefile')
-          if mk.exists():
-              s_mk = mk.read_text()
-              if 'susfs_compat_155.o' not in s_mk:
-                  s_mk += '\nifeq ($(CONFIG_KSU_SUSFS), y)\nksu-y += susfs_compat_155.o\nendif\n'
-                  mk.write_text(s_mk)
-          
-          # sanity checks for reported link errors
-          p = Path('KernelSU/kernel/sulog/event.c')
-          if p.exists():
-              txt = p.read_text()
-              if re.search(r'(?<!ksu_)\bstrncpy_from_user_nofault\s*\(', txt):
-                  raise SystemExit('raw strncpy_from_user_nofault still present in sulog/event.c')
-          p = Path('KernelSU/kernel/supercall/dispatch.c')
-          if p.exists() and 'kvcalloc(' in p.read_text():
-              raise SystemExit('kvcalloc still present in supercall/dispatch.c')
-          if not Path('KernelSU/kernel/susfs_compat_155.c').exists():
-              raise SystemExit('susfs_compat_155.c missing')
-          print('SukiSU/SUSFS 1.5.5 compat shims applied')
-          PYTHON
-          echo "4.14 SukiSU/SUSFS compatibility fixes applied"
 
       - name: Enable feature configs
         run: |
@@ -533,8 +382,11 @@ jobs:
           grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
           {
             echo ""
-            echo "# SukiSU Ultra / SUSFS (1.5.5 kernel-4.14) / NoMount"
+            echo "# SukiSU Ultra / SUSFS 1.5.5 / NoMount / KPM"
             echo "CONFIG_KSU=y"
+            # SukiSU's Kconfig wrongly marks every kernel as GKI (string compare on VERSION),
+            # which would select kprobe hooks. We use manual hooks instead.
+            echo "CONFIG_KSU_MANUAL_HOOK=y"
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -548,6 +400,8 @@ jobs:
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+            # sus_su is kprobe-only in this SukiSU generation and breaks manual-hook builds
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
             echo "CONFIG_NOMOUNT=y"
             echo "CONFIG_KPM=y"
             echo "CONFIG_KPROBES=y"
@@ -570,7 +424,22 @@ jobs:
           if grep -rE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64; then
             echo "bare -Werror still present"; exit 1
           fi
-          git diff --stat | tail -20
+
+      - name: Optional - bypass module CRC check
+        if: ${{ github.event.inputs.bypass_module_crc == 'true' }}
+        run: |
+          set -euo pipefail
+          # kernel/module.c check_version(): warn instead of rejecting a module whose
+          # imported-symbol CRC differs. Vermagic stays strict.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('kernel/module.c'); s = p.read_text()
+          old = 'pr_warn("%s: disagrees about version of symbol %s\\n",\n\t       info->name, symname);\n\treturn 0;'
+          new = 'pr_warn("%s: disagrees about version of symbol %s (bypassed)\\n",\n\t       info->name, symname);\n\treturn 1;'
+          assert s.count(old) == 1, 'check_version bad_version block not found'
+          p.write_text(s.replace(old, new))
+          PYTHON
+          grep -n "bypassed" kernel/module.c
 
       - name: Configure kernel
         shell: bash
@@ -578,12 +447,16 @@ jobs:
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
-          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
+          grep -E '^CONFIG_(CHARGER_BQ25890|KSU|KSU_MANUAL_HOOK|KSU_HOOK_KPROBES|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
         run: |
           grep -q '^CONFIG_CHARGER_BQ25890=y$' .config
           grep -q '^CONFIG_KSU=y$' .config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' .config
+          ! grep -q '^CONFIG_KSU_HOOK_KPROBES=y$' .config
+          grep -q '^CONFIG_KSU_SUSFS=y$' .config
+          grep -q '^CONFIG_NOMOUNT=y$' .config
           grep -q '^CONFIG_KPM=y$' .config
           grep -q '^CONFIG_MODVERSIONS=y$' .config
           ! grep -q '^CONFIG_JUMP_LABEL=y$' .config
@@ -641,6 +514,7 @@ jobs:
           sys.exit(1 if (bad or not have) else 0)
           PY
 
+
       - name: Print errors to summary
         if: always()
         run: |
@@ -652,6 +526,10 @@ jobs:
             echo "## Build errors"
             echo '```'
             grep -E "error:|\*\*\* .*Error|No rule to make target|undefined reference|not found" build.log | head -80 || echo "none matched"
+            echo '```'
+            echo "## SUSFS patch rejects (expected: namei/namespace/fdinfo/task_mmu/readdir)"
+            echo '```'
+            grep -E "FAILED|rej" susfs_patch.log || echo "none"
             echo '```'
             echo "## Last 40 lines of build.log"
             echo '```'
