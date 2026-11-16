@@ -180,11 +180,17 @@ jobs:
           if 'static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)' not in s:
               s = s.replace('static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n{',
                             '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n{\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t(void)file;\n#endif', 1)
-          if 'out_free_pathname:' not in s.split('inotify_fdinfo', 1)[1][:1600]:
+          if 'inotify_fdinfo' in s and 'out_free_pathname:' not in s.split('inotify_fdinfo', 1)[1][:2000]:
               old = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n\t\t/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t */\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);\n\t\tshow_mark_fhandle(m, inode);\n\t\tseq_putc(m, \'\\n\');\n\t\tiput(inode);\n\t}'
-              new = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n\t\t/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t */\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);\n\t\tshow_mark_fhandle(m, inode);\n\t\tseq_putc(m, \'\\n\');\n\t\tiput(inode);\n\t}'
+              new = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n\t\t{\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t\t   mask, mark->ignored_mask);\n\t\t\tshow_mark_fhandle(m, inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t}\n\t}'
               if old in s:
                   s = s.replace(old, new)
+              elif 'INODE_STATE_SUS_KSTAT' not in s and 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
+                  # If hunk 4 shape is different, do a targeted insertion before printing normal inotify info.
+                  marker = '\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);'
+                  if marker in s:
+                      ins = '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n'
+                      s = s.replace(marker, ins + marker, 1)
           p.write_text(s)
 
           # Remove known-resolved reject files and fail on any unexpected rejects.
@@ -199,6 +205,16 @@ jobs:
               for r in remaining:
                   print(' -', r)
               raise SystemExit(1)
+
+          # Fail fast if expected SUSFS fixups are missing.
+          checks = [
+              ('fs/namespace.c', 'susfs_mnt_id_ida'),
+              ('fs/proc/task_mmu.c', 'CONFIG_KSU_SUSFS_SUS_KSTAT'),
+          ]
+          for path, marker in checks:
+              txt = Path(path).read_text()
+              if marker not in txt:
+                  raise SystemExit(f'Missing expected SUSFS marker {marker} in {path}')
           print('SUSFS integrated with conflict fixups')
           PYTHON
           echo "SUSFS integrated"
@@ -315,10 +331,21 @@ jobs:
           # Guard SUSFS extension code that expects newer susfs kernel symbols/APIs.
           for path in Path('drivers/kernelsu').rglob('susfs_extension.c'):
               s = path.read_text()
-              # Replace common v2-only calls with safe stubs where needed.
               s = re.sub(r'\bsusfs_show_variant\s*\([^)]*\)', '0', s)
               s = re.sub(r'\bsusfs_show_version\s*\([^)]*\)', '0', s)
               path.write_text(s)
+
+          # Final sanity checks for common failure points.
+          for kpm_path in ['drivers/kernelsu/kpm/kpm.c', 'drivers/kernelsu/extension/kpm/kpm.c']:
+              p = Path(kpm_path)
+              if p.exists():
+                  s = p.read_text()
+                  if re.search(r'\baccess_ok\s*\(\s*u64_to_user_ptr\(cmd\.result_code\)\s*,\s*sizeof\(result\)\s*\)', s):
+                      raise SystemExit(f'2-arg access_ok still present in {kpm_path}')
+          if 'CMD_SUSFS_ADD_SUS_PATH_LOOP' in Path('drivers/kernelsu/supercall/dispatch.c').read_text():
+              raise SystemExit('Unsupported SUSFS command still present in dispatch.c')
+          if 'susfs_mnt_id_ida' not in Path('fs/namespace.c').read_text():
+              raise SystemExit('susfs_mnt_id_ida missing from fs/namespace.c')
           PYTHON
 
       - name: Enable feature configs
