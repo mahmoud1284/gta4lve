@@ -80,7 +80,7 @@ jobs:
           fi
           grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h
           grep -q 'REPO_OWNER  := SukiSU-Nova' KernelSU/kernel/Kbuild
-          grep -q 'CONFIG_KSU_MANUAL_SU' KernelSU/kernel/Kconfig
+          grep -q '^config KSU_MANUAL_SU$' KernelSU/kernel/Kconfig
           echo "SukiSU Nova integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
