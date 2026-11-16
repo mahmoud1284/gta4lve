@@ -483,7 +483,7 @@ jobs:
           
           mk = Path('KernelSU/kernel/Makefile')
           if mk.exists():
-              s = mk.read_text()
+              s_mk = mk.read_text()
               if 'susfs_compat_155.o' not in s_mk:
                   s_mk += '\nifeq ($(CONFIG_KSU_SUSFS), y)\nksu-y += susfs_compat_155.o\nendif\n'
                   mk.write_text(s_mk)
