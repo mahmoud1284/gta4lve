@@ -412,19 +412,70 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             WT_BSP_BOARD_NAME=P15945AA1 prepare
 
-      # SukiSU's Makefile backports path_umount()/can_umount() into fs/namespace.c while
-      # it is parsed. With a parallel build fs/namespace.o can be compiled before that
-      # happens -> "undefined symbol: path_umount" at link time. Run the injection first.
+      # Nova no longer uses Ultra's old ksu.o target or its Makefile-time compat injection.
+      # Add the 4.14 path_umount backport before building the composite kernelsu.o target.
       - name: Apply SukiSU compat edits before the real build
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          namespace = Path('fs/namespace.c')
+          s = namespace.read_text()
+          if 'static int can_umount(const struct path *path, int flags)' not in s:
+              marker = 'static bool is_mnt_ns_file'
+              assert s.count(marker) == 1, 'namespace.c insertion marker not found uniquely'
+              compat = '''static int can_umount(const struct path *path, int flags)
+          {
+                  struct mount *mnt = real_mount(path->mnt);
+                  if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+                          return -EINVAL;
+                  if (!may_mount())
+                          return -EPERM;
+                  if (path->dentry != path->mnt->mnt_root)
+                          return -EINVAL;
+                  if (!check_mnt(mnt))
+                          return -EINVAL;
+                  if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                          return -EINVAL;
+                  if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+                          return -EPERM;
+                  return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+                  struct mount *mnt = real_mount(path->mnt);
+                  int ret;
+                  ret = can_umount(path, flags);
+                  if (!ret)
+                          ret = do_umount(mnt, flags);
+                  dput(path->dentry);
+                  mntput_no_expire(mnt);
+                  return ret;
+          }
+
+          '''
+              namespace.write_text(s.replace(marker, compat + marker, 1))
+
+          internal = Path('fs/internal.h')
+          s = internal.read_text()
+          if 'int path_umount(struct path *path, int flags);' not in s:
+              marker = 'extern void __init mnt_init'
+              assert s.count(marker) == 1, 'internal.h insertion marker not found uniquely'
+              s = s.replace(marker, 'int path_umount(struct path *path, int flags);\n' + marker, 1)
+              internal.write_text(s)
+          assert 'int path_umount(struct path *path, int flags)' in namespace.read_text()
+          assert 'int path_umount(struct path *path, int flags);' in internal.read_text()
+          PYTHON
           make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            WT_BSP_BOARD_NAME=P15945AA1 drivers/kernelsu/ksu.o 2>&1 | tee compat.log
+            WT_BSP_BOARD_NAME=P15945AA1 drivers/kernelsu/ 2>&1 | tee compat.log
           grep -q '^int path_umount' fs/namespace.c
           grep -q '^static int can_umount' fs/namespace.c
           grep -q 'int path_umount' fs/internal.h
+          test -f drivers/kernelsu/kernelsu.o
           echo "compat edits applied"
 
       - name: Build kernel
