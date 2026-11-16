@@ -37,42 +37,42 @@ jobs:
           aarch64-linux-gnu-ar --version | head -1
           aarch64-linux-gnu-objdump --version | head -1
 
-      - name: Integrate SukiSU (builtin, Non-GKI compatible)
+      - name: Integrate SukiSU Ultra (builtin)
         run: |
           set -euo pipefail
-          # Use a Non-GKI-focused SukiSU builtin fork for better 4.14 compatibility.
-          curl -LSs "https://raw.githubusercontent.com/xiziya/SukiSU_Non-GKI/builtin/kernel/setup.sh" | bash
+          curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" | bash -s builtin
           if [ ! -e drivers/kernelsu ]; then
-            echo "SukiSU integration failed: drivers/kernelsu not found"
+            echo "SukiSU Ultra integration failed: drivers/kernelsu not found"
             exit 1
           fi
-          # 4.14 kernels use access_ok(type, addr, size); patch KPM calls if present.
-          if [ -f drivers/kernelsu/kpm/kpm.c ]; then
-            python3 - <<'PY'
+
+          python3 - <<'PYTHON'
           from pathlib import Path
           import re
+
+          # 4.14 compat: static_call.h is unavailable
+          p = Path('drivers/kernelsu/kernel_includes.h')
+          if p.exists():
+              s = p.read_text()
+              s = s.replace('#include <linux/static_call.h>\n',
+                            '#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)\n#include <linux/static_call.h>\n#endif\n')
+              p.write_text(s)
+
+          # 4.14 compat: KPM uses 2-arg access_ok in newer code; kernel 4.14 expects 3 args.
           p = Path('drivers/kernelsu/kpm/kpm.c')
-          s = p.read_text()
-          # Convert common 2-arg access_ok(addr, size) forms to 3-arg for older kernels.
-          # Heuristic: read checks -> VERIFY_READ, write checks -> VERIFY_WRITE where obvious.
-          patterns = [
-              (r'access_ok\(\s*args\s*,', 'access_ok(VERIFY_READ, args,'),
-              (r'access_ok\(\s*arg2\s*,', 'access_ok(VERIFY_READ, arg2,'),
-              (r'access_ok\(\s*arg3\s*,', 'access_ok(VERIFY_READ, arg3,'),
-              (r'access_ok\(\s*arg4\s*,', 'access_ok(VERIFY_READ, arg4,'),
-              (r'access_ok\(\s*arg5\s*,', 'access_ok(VERIFY_READ, arg5,'),
-              (r'access_ok\(\s*out_info\s*,', 'access_ok(VERIFY_WRITE, out_info,'),
-              (r'access_ok\(\s*ctl_args\s*,', 'access_ok(VERIFY_READ, ctl_args,'),
-              (r'access_ok\(\s*buf\s*,', 'access_ok(VERIFY_WRITE, buf,'),
-          ]
-          for pat, rep in patterns:
-              s = re.sub(pat, rep, s)
-          # Generic fallback: access_ok(x, y) -> access_ok(VERIFY_READ, x, y) when only 2 args remain.
-          s = re.sub(r'access_ok\(\s*([^,\n]+?)\s*,\s*([^,\n]+?)\s*\)', lambda m: f'access_ok(VERIFY_READ, {m.group(1).strip()}, {m.group(2).strip()})' if m.group(0).count(',') == 1 else m.group(0), s)
-          p.write_text(s)
-          PY
-          fi
-          echo "SukiSU (builtin, Non-GKI compatible) integrated"
+          if p.exists():
+              s = p.read_text()
+              def repl(m):
+                  a, b = m.group(1).strip(), m.group(2).strip()
+                  if a in ('VERIFY_READ', 'VERIFY_WRITE'):
+                      return m.group(0)
+                  write_like = a in ('out_info', 'buf', 'res', 'ctl_args') or b.endswith('out_sz') or b.endswith('buf_sz')
+                  t = 'VERIFY_WRITE' if write_like else 'VERIFY_READ'
+                  return f'access_ok({t}, {a}, {b})'
+              s = re.sub(r'\baccess_ok\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)', repl, s)
+              p.write_text(s)
+          PYTHON
+          echo "SukiSU Ultra (builtin) integrated"
 
       - name: Integrate SUSFS (kernel-4.14)
         run: |
@@ -91,172 +91,92 @@ jobs:
             patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
           fi
 
-          python3 - <<'PY'
+          python3 - <<'PYTHON'
           from pathlib import Path
           import re
 
-          def ensure_block(path, marker, block, after_regex=None):
-              p = Path(path)
-              s = p.read_text()
-              if marker in s:
-                  return
-              if after_regex:
-                  m = re.search(after_regex, s, re.M)
-                  if not m:
-                      raise SystemExit(f'anchor not found for {path}')
-                  idx = m.end()
-                  s = s[:idx] + block + s[idx:]
-              else:
-                  s = block + s
+          # fs/namei.c: ensure susfs include exists
+          p = Path('fs/namei.c')
+          s = p.read_text()
+          if '#if defined(CONFIG_KSU_SUSFS_SUS_PATH)' not in s:
+              s = s.replace('#include <linux/uaccess.h>\n',
+                            '#include <linux/uaccess.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
               p.write_text(s)
 
-          # fs/namei.c: ensure susfs include exists
-          namei = Path('fs/namei.c')
-          s = namei.read_text()
-          if 'CONFIG_KSU_SUSFS_SUS_PATH' not in s or '#include <linux/susfs_def.h>' not in s.split('CONFIG_KSU_SUSFS_SUS_PATH',1)[0][-200:]:
-              s = s.replace('#include <linux/uaccess.h>\n',
-                            '#include <linux/uaccess.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n')
-              namei.write_text(s)
-
-          # fs/namespace.c: ensure susfs top-level defs
-          ns = Path('fs/namespace.c')
-          s = ns.read_text()
-          if 'susfs_mnt_id_ida' not in s:
-              s = s.replace('#include <linux/fslog.h>\n', '#include <linux/fslog.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n')
-              insert_after = '#include "internal.h"\n'
-              if insert_after not in s:
-                  raise SystemExit('namespace.c internal.h include not found')
-              sus_block = r'''
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-          extern bool susfs_is_current_ksu_domain(void);
-          extern bool susfs_is_current_zygote_domain(void);
-
-          static DEFINE_IDA(susfs_mnt_id_ida);
-          static DEFINE_IDA(susfs_mnt_group_ida);
-
-          static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
-          static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
-
-          #define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
-          #define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
-          #endif
-
-          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
-          extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
-          bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
-          #endif
-          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
-          extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
-          bool susfs_is_auto_add_sus_bind_mount_enabled = true;
-          #endif
-          #ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
-          extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
-          bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
-          #endif
-          '''
-              s = s.replace(insert_after, insert_after + sus_block + '\n')
-              ns.write_text(s)
-
           # fs/proc/task_mmu.c: ensure sus_kstat include
-          tmm = Path('fs/proc/task_mmu.c')
-          s = tmm.read_text()
+          p = Path('fs/proc/task_mmu.c')
+          s = p.read_text()
           if 'CONFIG_KSU_SUSFS_SUS_KSTAT' not in s:
-              s = s.replace('#include <linux/ctype.h>\n', '#include <linux/ctype.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n')
-              tmm.write_text(s)
+              if '#include <linux/ctype.h>\n' in s:
+                  s = s.replace('#include <linux/ctype.h>\n', '#include <linux/ctype.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              else:
+                  s = s.replace('#include <linux/mm_inline.h>\n', '#include <linux/mm_inline.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              p.write_text(s)
+
+          # fs/namespace.c: ensure susfs top-level defs required by susfs 1.5.5 patches
+          p = Path('fs/namespace.c')
+          s = p.read_text()
+          if 'susfs_mnt_id_ida' not in s:
+              s = s.replace('#include <linux/fslog.h>\n', '#include <linux/fslog.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              block = '''
+#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+extern bool susfs_is_current_ksu_domain(void);
+extern bool susfs_is_current_zygote_domain(void);
+
+static DEFINE_IDA(susfs_mnt_id_ida);
+static DEFINE_IDA(susfs_mnt_group_ida);
+
+static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;
+static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;
+
+#define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */
+#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT
+extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);
+bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT
+extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);
+bool susfs_is_auto_add_sus_bind_mount_enabled = true;
+#endif
+#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT
+extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);
+bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;
+#endif
+'''
+              s = s.replace('#include "internal.h"\n', '#include "internal.h"\n' + block + '\n', 1)
+              p.write_text(s)
 
           # fs/readdir.c: compat_fillonedir sus_path filter
-          rd = Path('fs/readdir.c')
-          s = rd.read_text()
-          old = '\tif (buf->result)\n\t\treturn -EINVAL;\n\td_ino = ino;\n\tif (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {'
-          if old in s and 'susfs_sus_ino_for_filldir64' not in s.split('compat_fillonedir',1)[1][:400]:
+          p = Path('fs/readdir.c')
+          s = p.read_text()
+          if 'compat_fillonedir' in s and 'susfs_sus_ino_for_filldir64(' not in s:
+              old = '\tif (buf->result)\n\t\treturn -EINVAL;\n\td_ino = ino;\n\tif (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {'
               new = '\tif (buf->result)\n\t\treturn -EINVAL;\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) && susfs_sus_ino_for_filldir64(ino)) {\n\t\treturn 0;\n\t}\n#endif\n\td_ino = ino;\n\tif (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {'
-              s = s.replace(old, new)
-              rd.write_text(s)
+              if old in s:
+                  s = s.replace(old, new)
+                  p.write_text(s)
 
-          # fs/notify/fdinfo.c: ensure sus_mount-aware inotify/fanotify callbacks
-          fdinfo = Path('fs/notify/fdinfo.c')
-          s = fdinfo.read_text()
+          # fs/notify/fdinfo.c: sus_mount-aware callbacks for this kernel's fdinfo API
+          p = Path('fs/notify/fdinfo.c')
+          s = p.read_text()
           if 'static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)' not in s:
               s = s.replace('static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n{',
-                            '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n{\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t(void)file;\n#endif')
-              fdinfo.write_text(s)
-              s = fdinfo.read_text()
-          if 'path.dentry->d_inode->i_ino, path.dentry->d_inode->i_sb->s_dev,' not in s:
-              old = '''\tinode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
-          \tinode = igrab(mark->connector->inode);
-          \tif (inode) {
-          \t\t/*
-          \t\t * IN_ALL_EVENTS represents all of the mask bits
-          \t\t * that we expose to userspace.  There is at
-          \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-          \t\t * used only internally to the kernel.
-          \t\t */
-          \t\tu32 mask = mark->mask & IN_ALL_EVENTS;
-          \t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
-          \t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
-          \t\t\t   mask, mark->ignored_mask);
-          \t\tshow_mark_fhandle(m, inode);
-          \t\tseq_putc(m, '\\n');
-          \t\tiput(inode);
-          \t}'''
-              new = '''\tinode_mark = container_of(mark, struct inotify_inode_mark, fsn_mark);
-          \tinode = igrab(mark->connector->inode);
-          \tif (inode) {
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-          \t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&
-          \t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {
-          \t\t\tstruct path path;
-          \t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);
-          \t\t\tchar *dpath;
-          \t\t\tif (!pathname)
-          \t\t\t\tgoto out_seq_printf;
-          \t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);
-          \t\t\tif (!dpath)
-          \t\t\t\tgoto out_free_pathname;
-          \t\t\tif (kern_path(dpath, 0, &path))
-          \t\t\t\tgoto out_free_pathname;
-          \t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",
-          \t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,
-          \t\t\t\t   path.dentry->d_inode->i_sb->s_dev,
-          \t\t\t\t   inotify_mark_user_mask(mark));
-          \t\t\tshow_mark_fhandle(m, path.dentry->d_inode);
-          \t\t\tseq_putc(m, '\\n');
-          \t\t\tiput(inode);
-          \t\t\tpath_put(&path);
-          \t\t\tkfree(pathname);
-          \t\t\treturn;
-          out_free_pathname:
-          \t\t\tkfree(pathname);
-          \t\t}
-          out_seq_printf:
-          #endif
-          \t\t/*
-          \t\t * IN_ALL_EVENTS represents all of the mask bits
-          \t\t * that we expose to userspace.  There is at
-          \t\t * least one bit (FS_EVENT_ON_CHILD) which is
-          \t\t * used only internally to the kernel.
-          \t\t */
-          \t\tu32 mask = mark->mask & IN_ALL_EVENTS;
-          \t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",
-          \t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,
-          \t\t\t   mask, mark->ignored_mask);
-          \t\tshow_mark_fhandle(m, inode);
-          \t\tseq_putc(m, '\\n');
-          \t\tiput(inode);
-          \t}'''
-              if old not in s:
-                  # Fallback: minimal targeted replacement
-                  s = s.replace('\t\tu32 mask = mark->mask & IN_ALL_EVENTS;',
-                                '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   inotify_mark_user_mask(mark));\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\n\t\t}\n\t\tgoto out_seq_printf;\nout_free_pathname:\n\t\tkfree(pathname);\nout_seq_printf:\n#endif\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;', 1)
-              else:
+                            '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n{\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t(void)file;\n#endif', 1)
+          if 'out_free_pathname:' not in s.split('inotify_fdinfo', 1)[1][:1600]:
+              old = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n\t\t/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t */\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);\n\t\tshow_mark_fhandle(m, inode);\n\t\tseq_putc(m, \'\\n\');\n\t\tiput(inode);\n\t}'
+              new = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n\t\t/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t */\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);\n\t\tshow_mark_fhandle(m, inode);\n\t\tseq_putc(m, \'\\n\');\n\t\tiput(inode);\n\t}'
+              if old in s:
                   s = s.replace(old, new)
-              fdinfo.write_text(s)
+          p.write_text(s)
 
-          # Remove reject files from known-resolved conflicts to keep tree clean.
+          # Remove known-resolved reject files and fail on any unexpected rejects.
           for rej in ['fs/namei.c.rej','fs/namespace.c.rej','fs/proc/task_mmu.c.rej','fs/notify/fdinfo.c.rej','fs/readdir.c.rej']:
-              p = Path(rej)
-              if p.exists():
-                  p.unlink()
+              rp = Path(rej)
+              if rp.exists():
+                  rp.unlink()
 
           remaining = sorted(str(p) for p in Path('.').rglob('*.rej'))
           if remaining:
@@ -265,7 +185,7 @@ jobs:
                   print(' -', r)
               raise SystemExit(1)
           print('SUSFS integrated with conflict fixups')
-          PY
+          PYTHON
           echo "SUSFS integrated"
 
       - name: Integrate NoMount
@@ -288,6 +208,97 @@ jobs:
           fi
           echo "NoMount integrated"
 
+      - name: Apply 4.14 SukiSU/SUSFS compatibility fixes
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          def patch_text(path, replacer):
+              p = Path(path)
+              if not p.exists():
+                  return
+              s = p.read_text()
+              ns = replacer(s)
+              if ns != s:
+                  p.write_text(ns)
+
+          # Ensure SUSFS 1.5.5 headers provide flags/defs expected by patched kernel code.
+          def fix_susfs_def(s):
+              if 'TASK_STRUCT_NON_ROOT_USER_APP_PROC' not in s:
+                  s += '\n#ifndef TASK_STRUCT_NON_ROOT_USER_APP_PROC\n#define TASK_STRUCT_NON_ROOT_USER_APP_PROC BIT(24)\n#endif\n'
+              if 'INODE_STATE_SUS_KSTAT' not in s:
+                  s += '\n#ifndef INODE_STATE_SUS_KSTAT\n#define INODE_STATE_SUS_KSTAT BIT(26)\n#endif\n'
+              if 'CL_COPY_MNT_NS' not in s:
+                  s += '\n#ifndef CL_COPY_MNT_NS\n#define CL_COPY_MNT_NS BIT(25)\n#endif\n#ifndef CL_ZYGOTE_COPY_MNT_NS\n#define CL_ZYGOTE_COPY_MNT_NS BIT(24)\n#endif\n'
+              return s
+          patch_text('include/linux/susfs_def.h', fix_susfs_def)
+
+          # Bridge SukiSU Ultra's modern SUSFS supercall usage to susfs4ksu 1.5.5 kernel APIs.
+          def fix_dispatch(s):
+              s = s.replace('if (magic2 == SUSFS_MAGIC && current_uid().val == 0) {', 'if (current_uid().val == 0) {')
+              repls = [
+                  (r'susfs_add_sus_path\(arg\);', 'susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);'),
+                  (r'susfs_add_sus_path_loop\(arg\);', 'susfs_add_sus_path((struct st_susfs_sus_path __user *)*arg);'),
+                  (r'susfs_add_sus_kstat\(arg\);', 'susfs_add_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);'),
+                  (r'susfs_update_sus_kstat\(arg\);', 'susfs_update_sus_kstat((struct st_susfs_sus_kstat __user *)*arg);'),
+                  (r'susfs_set_uname\(arg\);', 'susfs_set_uname((struct st_susfs_uname __user *)*arg);'),
+                  (r'susfs_add_open_redirect\(arg\);', 'susfs_add_open_redirect((struct st_susfs_open_redirect __user *)*arg);'),
+                  (r'susfs_set_cmdline_or_bootconfig\(arg\);', 'susfs_set_cmdline_or_bootconfig((char __user *)*arg);'),
+                  (r'susfs_enable_log\(arg\);', 'susfs_set_log((bool)(unsigned long)*arg);'),
+              ]
+              for pat, rep in repls:
+                  s = re.sub(pat, rep, s)
+
+              # Remove/replace v2-only commands not present in 1.5.5.
+              removals = [
+                  r'\s*case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:\s*\n\s*susfs_set_hide_sus_mnts_for_non_su_procs\(.*?\);\s*\n\s*return 0;',
+                  r'\s*case CMD_SUSFS_ADD_SUS_MAP:\s*\n\s*susfs_add_sus_map\(.*?\);\s*\n\s*return 0;',
+                  r'\s*case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:\s*\n\s*susfs_set_avc_log_spoofing\(.*?\);\s*\n\s*return 0;',
+                  r'\s*case CMD_SUSFS_SHOW_ENABLED_FEATURES:\s*\n\s*susfs_get_enabled_features\(.*?\);\s*\n\s*return 0;',
+              ]
+              for pat in removals:
+                  s = re.sub(pat, '\n            /* not supported by susfs4ksu 1.5.5 */', s, flags=re.S)
+
+              s = re.sub(r'case CMD_SUSFS_SHOW_VARIANT:\s*\n\s*susfs_show_variant\(.*?\);\s*\n\s*return 0;',
+                         'case CMD_SUSFS_SHOW_VARIANT:\n            return 0;', s)
+              s = re.sub(r'case CMD_SUSFS_SHOW_VERSION:\s*\n\s*susfs_show_version\(.*?\);\s*\n\s*return 0;',
+                         'case CMD_SUSFS_SHOW_VERSION:\n            return 0;', s)
+
+              # Add 1.5.5 mount/try_umount commands when missing.
+              if 'CMD_SUSFS_ADD_SUS_MOUNT' not in s and 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
+                  s = s.replace('#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                                '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n        case CMD_SUSFS_ADD_SUS_MOUNT:\n            susfs_add_sus_mount((struct st_susfs_sus_mount __user *)*arg);\n            return 0;', 1)
+              if 'CMD_SUSFS_ADD_TRY_UMOUNT' not in s and 'CONFIG_KSU_SUSFS_TRY_UMOUNT' in s:
+                  s = s.replace('#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT',
+                                '#ifdef CONFIG_KSU_SUSFS_TRY_UMOUNT\n        case CMD_SUSFS_ADD_TRY_UMOUNT:\n            susfs_add_try_umount((struct st_susfs_try_umount __user *)*arg);\n            return 0;\n        case CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS:\n            susfs_try_umount(current_uid().val);\n            return 0;', 1)
+
+              # Ensure 1.5.5 command IDs are available when SukiSU headers don't define them.
+              if 'CMD_SUSFS_ADD_SUS_MOUNT' in s and '#ifndef CMD_SUSFS_ADD_SUS_MOUNT' not in s:
+                  s = s.replace('#include <linux/susfs_def.h>', '#include <linux/susfs_def.h>\n#ifndef CMD_SUSFS_ADD_SUS_MOUNT\n#define CMD_SUSFS_ADD_SUS_MOUNT 0x55560\n#endif\n#ifndef CMD_SUSFS_ADD_TRY_UMOUNT\n#define CMD_SUSFS_ADD_TRY_UMOUNT 0x55580\n#endif\n#ifndef CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS\n#define CMD_SUSFS_RUN_UMOUNT_FOR_CURRENT_MNT_NS 0x555d0\n#endif', 1)
+              return s
+          patch_text('drivers/kernelsu/supercall/dispatch.c', fix_dispatch)
+
+          # Avoid hard dependency on v2-only susfs helpers in other SukiSU code when building with 1.5.5.
+          for path in Path('drivers/kernelsu').rglob('*.c'):
+              sp = str(path)
+              if sp.endswith('supercall/dispatch.c'):
+                  continue
+              s = path.read_text()
+              if 'susfs_get_enabled_features(' in s:
+                  s = s.replace('susfs_get_enabled_features(', '(0 /* compat 1.5.5 */)')
+                  path.write_text(s)
+
+          # Guard SUSFS extension code that expects newer susfs kernel symbols/APIs.
+          for path in Path('drivers/kernelsu').rglob('susfs_extension.c'):
+              s = path.read_text()
+              # Replace common v2-only calls with safe stubs where needed.
+              s = re.sub(r'\bsusfs_show_variant\s*\([^)]*\)', '0', s)
+              s = re.sub(r'\bsusfs_show_version\s*\([^)]*\)', '0', s)
+              path.write_text(s)
+          PYTHON
+
       - name: Enable feature configs
         run: |
           set -euo pipefail
@@ -299,7 +310,7 @@ jobs:
           grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
           {
             echo ""
-            echo "# SukiSU Ultra / SUSFS / NoMount"
+            echo "# SukiSU Ultra / SUSFS (1.5.5 kernel-4.14) / NoMount"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
@@ -310,7 +321,10 @@ jobs:
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
             echo "CONFIG_NOMOUNT=y"
             echo "CONFIG_KPM=y"
             echo "CONFIG_KPROBES=y"
