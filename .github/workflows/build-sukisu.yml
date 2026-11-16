@@ -287,6 +287,8 @@ jobs:
           grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
           sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG"
           grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
+          # Avoid duplicate override warnings for symbols already present in this vendor defconfig.
+          sed -i -E '/^(# )?CONFIG_(KPROBES|KALLSYMS|KALLSYMS_ALL)(=| is not set)/d' "$DEFCONFIG"
           {
             echo ""
             echo "# SukiSU Nova / SUSFS 1.5.5 / NoMount / KPM"
@@ -356,8 +358,7 @@ jobs:
           # Re-assert these symbols after defconfig. This kernel tree has several
           # vendor config layers; scripts/config makes the intended final state explicit.
           scripts/config --file .config --enable I2C --enable GPIOLIB --enable CHARGER_BQ25890
-          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu- olddefconfig 2>&1 | tee -a config.log
+          scripts/config --state I2C --state GPIOLIB --state CHARGER_BQ25890
           grep -E '^CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
 
       - name: Check required configs
