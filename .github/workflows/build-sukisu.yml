@@ -45,6 +45,7 @@ jobs:
             echo "SukiSU Ultra integration failed: drivers/kernelsu not found"
             exit 1
           fi
+          echo "SukiSU Ultra commit: $(git -C KernelSU rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
 
           python3 - <<'PYTHON'
           from pathlib import Path
@@ -106,7 +107,7 @@ jobs:
           if [ -f /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch ]; then
             # Apply kernel-side SUSFS patch. This vendor 4.14.190 tree has known context conflicts;
             # apply with rejects and resolve the expected conflicts below.
-            patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch || true
+            patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch 2>&1 | tee susfs_patch.log || true
           fi
 
           python3 - <<'PYTHON'
@@ -228,6 +229,20 @@ jobs:
               raise SystemExit('susfs_def.h include missing from fs/proc/task_mmu.c')
           print('SUSFS integrated with conflict fixups')
           PYTHON
+
+          # SUSFS builtin mode relies on inline hooks inside the kernel patch. If they
+          # are missing the kernel still builds but root silently never works.
+          test -f fs/susfs.c
+          test -f include/linux/susfs.h
+          test -f include/linux/susfs_def.h
+          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c; do
+            if grep -q 'ksu_handle_\|susfs_' "$f"; then
+              echo "hook ok: $f"
+            else
+              echo "::error::no KernelSU/SUSFS hook found in $f (SUSFS patch hunk did not apply)"
+              exit 1
+            fi
+          done
           echo "SUSFS integrated"
 
       - name: Integrate NoMount
@@ -247,7 +262,11 @@ jobs:
           fi
           grep -q "obj-\$(CONFIG_NOMOUNT)" fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
           if [ -f fs/nomount/Kconfig ]; then
-            grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig || sed -i '/^endmenu/i\source "fs/nomount/Kconfig"' fs/Kconfig
+            if ! grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+              awk '/^endmenu/ { last = NR } { l[NR] = $0 }
+                   END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print l[i] } }' \
+                fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+            fi
           fi
           echo "NoMount integrated"
 
@@ -587,6 +606,41 @@ jobs:
           ls -l arch/arm64/boot/Image
           strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
 
+      - name: Verify module CRCs against stock vendor modules
+        continue-on-error: true
+        shell: bash
+        run: |
+          # SUSFS adds fields to task_struct/inode. If that changes the CRC of a symbol
+          # the stock vendor modules (mali_gondul, sprd_camera) import, the kernel will
+          # reject them at boot (bootloop). This step lists every mismatch.
+          test -f .github/vendor_crcs.txt || { echo "::warning::.github/vendor_crcs.txt missing, skipping CRC check"; exit 0; }
+          python3 - <<'PY'
+          import os, subprocess, sys
+          need = {}
+          for line in open(".github/vendor_crcs.txt"):
+              if line.strip():
+                  name, crc = line.split()
+                  need[name] = int(crc, 16)
+          out = subprocess.run(["llvm-nm", "vmlinux"], capture_output=True, text=True).stdout
+          have = {}
+          for line in out.splitlines():
+              p = line.split()
+              if len(p) == 3 and p[2].startswith("__crc_"):
+                  have[p[2][6:]] = int(p[0], 16)
+          bad = [(n, need[n], have.get(n)) for n in sorted(need) if have.get(n) != need[n]]
+          lines = ["## Vendor module CRC check",
+                   f"kernel exports {len(have)} CRCs, vendor modules need {len(need)}, mismatches: {len(bad)}"]
+          if not have:
+              lines.append("ERROR: no __crc_ symbols found in vmlinux (is CONFIG_MODVERSIONS on?)")
+          for n, want, got in bad[:60]:
+              lines.append(f"- {n}: vendor wants 0x{want:08x}, kernel has " + ("MISSING" if got is None else f"0x{got:08x}"))
+          lines.append(f"module_layout: vendor 0x{need.get('module_layout', 0):08x}, kernel 0x{have.get('module_layout', 0):08x}")
+          text = "\n".join(lines)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
+          sys.exit(1 if (bad or not have) else 0)
+          PY
+
       - name: Print errors to summary
         if: always()
         run: |
@@ -613,6 +667,7 @@ jobs:
           path: |
             build.log
             config.log
+            susfs_patch.log
           if-no-files-found: warn
 
       - name: Upload build artifacts
