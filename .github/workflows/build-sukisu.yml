@@ -59,8 +59,10 @@ jobs:
               p.write_text(s)
 
           # 4.14 compat: KPM uses 2-arg access_ok in newer code; kernel 4.14 expects 3 args.
-          p = Path('drivers/kernelsu/kpm/kpm.c')
-          if p.exists():
+          def fix_access_ok(path):
+              p = Path(path)
+              if not p.exists():
+                  return
               s = p.read_text()
               def repl(m):
                   a, b = m.group(1).strip(), m.group(2).strip()
@@ -69,8 +71,14 @@ jobs:
                   write_like = a in ('out_info', 'buf', 'res', 'ctl_args') or b.endswith('out_sz') or b.endswith('buf_sz')
                   t = 'VERIFY_WRITE' if write_like else 'VERIFY_READ'
                   return f'access_ok({t}, {a}, {b})'
-              s = re.sub(r'\baccess_ok\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)', repl, s)
-              p.write_text(s)
+              ns = re.sub(r'\baccess_ok\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)', repl, s)
+              if ns != s:
+                  p.write_text(ns)
+
+          for kpm_path in ['drivers/kernelsu/kpm/kpm.c', 'drivers/kernelsu/extension/kpm/kpm.c']:
+              fix_access_ok(kpm_path)
+          for kpm_path in Path('drivers/kernelsu').rglob('kpm*.c'):
+              fix_access_ok(str(kpm_path))
           PYTHON
           echo "SukiSU Ultra (builtin) integrated"
 
@@ -252,10 +260,13 @@ jobs:
 
               # Remove/replace v2-only commands not present in 1.5.5.
               removals = [
+                  r'\s*case CMD_SUSFS_ADD_SUS_PATH_LOOP:\s*\n\s*susfs_add_sus_path_loop\(.*?\);\s*\n\s*return 0;',
                   r'\s*case CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:\s*\n\s*susfs_set_hide_sus_mnts_for_non_su_procs\(.*?\);\s*\n\s*return 0;',
                   r'\s*case CMD_SUSFS_ADD_SUS_MAP:\s*\n\s*susfs_add_sus_map\(.*?\);\s*\n\s*return 0;',
                   r'\s*case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:\s*\n\s*susfs_set_avc_log_spoofing\(.*?\);\s*\n\s*return 0;',
                   r'\s*case CMD_SUSFS_SHOW_ENABLED_FEATURES:\s*\n\s*susfs_get_enabled_features\(.*?\);\s*\n\s*return 0;',
+                  r'\s*case CMD_SUSFS_SET_PRIORITY_UID_FILTER:\s*\n\s*susfs_set_priority_uid_filter\(.*?\);\s*\n\s*return 0;',
+                  r'\s*case CMD_SUSFS_AVC_LOG_SPOOFING:\s*\n\s*susfs_set_avc_log_spoofing\(.*?\);\s*\n\s*return 0;',
               ]
               for pat in removals:
                   s = re.sub(pat, '\n            /* not supported by susfs4ksu 1.5.5 */', s, flags=re.S)
@@ -264,6 +275,10 @@ jobs:
                          'case CMD_SUSFS_SHOW_VARIANT:\n            return 0;', s)
               s = re.sub(r'case CMD_SUSFS_SHOW_VERSION:\s*\n\s*susfs_show_version\(.*?\);\s*\n\s*return 0;',
                          'case CMD_SUSFS_SHOW_VERSION:\n            return 0;', s)
+
+              # Catch-all: drop any remaining unsupported SUSFS command cases/calls cleanly.
+              s = re.sub(r'\n\s*case CMD_SUSFS_[A-Z0-9_]+:\s*\n\s*[^\n]*susfs_[a-z0-9_]*\([^;]*\);\s*\n\s*return 0;',
+                         '\n            /* unsupported SUSFS command for 1.5.5 */', s)
 
               # Add 1.5.5 mount/try_umount commands when missing.
               if 'CMD_SUSFS_ADD_SUS_MOUNT' not in s and 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
