@@ -368,11 +368,14 @@ jobs:
           p = Path('KernelSU/kernel/sulog/event.c')
           if p.exists():
               s = p.read_text()
-              s = s.replace(
-                  'strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));',
-                  'ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));'
-              )
-              p.write_text(s)
+              old = 'strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));'
+              new = 'ksu_strncpy_from_user_nofault(arg, (const void __user *)untagged_addr((unsigned long)arg_user), sizeof(arg));'
+              if old in s and new not in s:
+                  s = s.replace(old, new)
+                  p.write_text(s)
+              elif 'ksu_ksu_strncpy_from_user_nofault(' in s:
+                  s = s.replace('ksu_ksu_strncpy_from_user_nofault(', 'ksu_strncpy_from_user_nofault(')
+                  p.write_text(s)
 
           # kernel_compat.h: make ksu_strncpy_from_user_nofault header-safe and ensure uaccess include
           p = Path('KernelSU/kernel/kernel_compat.h')
