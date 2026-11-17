@@ -587,6 +587,24 @@ jobs:
           seccomp.write_text(text)
           wrapper = Path('KernelSU/kernel/infra/file_wrapper.c')
           text = wrapper.read_text()
+          legacy = '#else\n// There is no anon_inode_create_getfile before 5.16, but it\'s not difficult to implement it.\n'
+          if legacy in text and '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\nstatic struct file *ksu_anon_inode_create_getfile_compat' not in text:
+              compat = ('#else\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\n'
+                        'static struct file *ksu_anon_inode_create_getfile_compat(const char *name,\n'
+                        '                                                         const struct file_operations *fops,\n'
+                        '                                                         void *priv, int flags,\n'
+                        '                                                         const struct inode *context_inode)\n'
+                        '{\n'
+                        '    return anon_inode_getfile(name, fops, priv, flags);\n'
+                        '}\n#else\n'
+                        '// There is no anon_inode_create_getfile before 5.16, but it\'s not difficult to implement it.\n')
+              text = text.replace(legacy, compat, 1)
+              suffix = '\n}\n#endif\n\nint ksu_install_file_wrapper'
+              if text.count(suffix) != 1:
+                  raise SystemExit('file_wrapper anon inode fallback end not found uniquely')
+              text = text.replace(suffix, '\n}\n#endif\n#endif\n\nint ksu_install_file_wrapper', 1)
+          if '#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\nstatic struct file *ksu_anon_inode_create_getfile_compat' not in text:
+              raise SystemExit('file_wrapper 4.14 anon inode compatibility was not applied')
           text = text.replace(
               '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\nstatic int ksu_wrapper_iopoll',
               '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
