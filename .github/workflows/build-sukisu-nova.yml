@@ -417,15 +417,15 @@ jobs:
           t = t.replace(old, new, 1)
 
           old = '''    if (likely(orig_nr >= 0 && orig_nr < __NR_syscalls)) {
-              ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
-              if (likely(fn))
-                  return fn(orig_nr, regs);
-          }'''
+                  ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
+                  if (likely(fn))
+                      return fn(orig_nr, regs);
+              }'''
           new = '''    if (likely(orig_nr >= 0 && orig_nr < __NR_syscalls)) {
-              ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
-              if (likely(fn))
-                  return fn(orig_nr, frame);
-          }'''
+                  ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
+                  if (likely(fn))
+                      return fn(orig_nr, frame);
+              }'''
           assert t.count(old) == 1, 'dispatcher fn call not found'
           t = t.replace(old, new, 1)
           p.write_text(t)
