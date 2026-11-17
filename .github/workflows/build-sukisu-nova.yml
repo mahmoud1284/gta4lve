@@ -513,12 +513,12 @@ jobs:
                    '     * writing to it would corrupt slab memory: treat it as absent. */\n'
                    '    return;\n'
                    '#endif\n')
-          for fn in ('void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)\n{\n',
-                     'void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)\n{\n'):
-              assert t.count(fn) == 1, 'seccomp cache fn not found: %r' % fn
-              if 'KERNEL_VERSION(5, 15, 0)' not in t:
+          if 'writing to it would corrupt slab memory' not in t:
+              for fn in ('void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)\n{\n',
+                         'void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)\n{\n'):
+                  assert t.count(fn) == 1, 'seccomp cache fn not found: %r' % fn
                   t = t.replace(fn, fn + guard, 1)
-          p.write_text(t)
+              p.write_text(t)
           assert p.read_text().count('KERNEL_VERSION(5, 15, 0)') == 2
           PYTHON
           test "$(grep -c 'ksu_call_syscall_orig' KernelSU/kernel/feature/sucompat.c)" -eq 6
