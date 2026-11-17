@@ -525,21 +525,18 @@ jobs:
 
           lsm = Path('KernelSU/kernel/hook/lsm_hook.c')
           text = lsm.read_text()
-          text = text.replace('    struct hlist_head *head;\n', '    struct list_head *head;\n')
-          text = text.replace(
-              '    head = (struct hlist_head *)heads_addr;\n'
-              '    struct hlist_head *head_end = (struct hlist_head *)(heads_addr + heads_size);\n',
-              '    head = (struct list_head *)heads_addr;\n'
-              '    struct list_head *head_end = (struct list_head *)(heads_addr + heads_size);\n')
-          text = text.replace('        hlist_for_each_entry (entry, head, list) {',
-                              '        list_for_each_entry (entry, head, list) {')
-          text = text.replace(
-              '                if (head < (struct hlist_head *)heads_addr || head >= head_end) {',
-              '                if (head < (struct list_head *)heads_addr || head >= head_end) {')
-          if 'head->first' not in text:
-              raise SystemExit('Nova 4.14 LSM hlist block not found')
+          # Nova's non-static-call path is written for hlist_head, while 4.14's
+          # security_hook_heads use ordinary list_head entries. Transform the
+          # actual symbols independently; do not depend on one exact block or
+          # indentation surviving the upstream checkout.
+          required = ('struct hlist_head', 'hlist_for_each_entry', 'head->first')
+          if not all(token in text for token in required):
+              raise SystemExit('Nova 4.14 LSM hlist symbols not found')
+          text = text.replace('struct hlist_head', 'struct list_head')
+          text = text.replace('hlist_for_each_entry', 'list_for_each_entry')
+          text = text.replace('hlist_entry(head->first, struct security_hook_list, list)',
+                              'list_first_entry(head, struct security_hook_list, list)')
           text = text.replace('if (head->first) {', 'if (head->next != head) {', 1)
-          text = text.replace('hlist_entry(head->first, struct security_hook_list, list)', 'list_first_entry(head, struct security_hook_list, list)', 1)
           text = text.replace('hook->list.list.next = NULL;', 'hook->list.list.next = head->next;', 1)
           text = text.replace('hook->list.list.pprev = &head->first;', 'hook->list.list.prev = head;', 1)
           text = text.replace('selected_slot = (void **)&head->first;', 'selected_slot = (void **)&head->next;', 1)
@@ -558,7 +555,7 @@ jobs:
               text = text.replace(marker, replacement, 1)
           lsm.write_text(text)
           assert '#include <linux/pgtable.h>' not in sucompat.read_text()
-          assert 'list_for_each_entry (entry, head, list)' in lsm.read_text()
+          assert 'list_for_each_entry' in lsm.read_text()
           assert 'head->first' not in lsm.read_text()
           assert 'list->pprev' not in lsm.read_text()
           PYTHON
