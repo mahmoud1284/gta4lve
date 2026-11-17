@@ -765,30 +765,27 @@ jobs:
           profile.write_text(text)
           cpu = Path('KernelSU/kernel/extension/cpu_spoof.c')
           text = cpu.read_text()
-          text = text.replace('#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n',
-                              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n'
-                              '#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n#endif\n', 1)
-          marker = '''            if (part != ARM_CPU_PART_NEOVERSE_N1 &&
-                part != ARM_CPU_PART_CORTEX_A76 &&
-                part != QCOM_CPU_PART_KRYO_4XX_GOLD) {
-          '''
-          if marker in text and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n                if (part != ARM_CPU_PART_NEOVERSE_N1' not in text:
-              text = text.replace(marker, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n' + marker, 1)
-              end = '''                }
-            }
-          }
-          }
-          #endif
-          '''
-              if end not in text:
-                  raise SystemExit('cpu_spoof vDSO guard end not found')
-              text = text.replace(end, '''                }
-            }
-          #endif
-          }
-          }
-          #endif
-          ''', 1)
+          includes = '#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n'
+          guarded_includes = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n'
+                              + includes + '#endif\n')
+          if includes in text:
+              text = text.replace(includes, guarded_includes, 1)
+          branch = ('            if (part != ARM_CPU_PART_NEOVERSE_N1 &&\n'
+                    '                part != ARM_CPU_PART_CORTEX_A76 &&\n'
+                    '                part != QCOM_CPU_PART_KRYO_4XX_GOLD) {\n')
+          guard = '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n'
+          if guard + branch not in text:
+              if text.count(branch) != 1:
+                  raise SystemExit('cpu_spoof vDSO branch not found uniquely')
+              text = text.replace(branch, guard + branch, 1)
+              tail = '\n        }\n    }\n#endif\n\n    /*\n'
+              if text.count(tail) != 1:
+                  raise SystemExit('cpu_spoof vDSO guard end not found uniquely')
+              text = text.replace(tail, '\n#endif\n        }\n    }\n#endif\n\n    /*\n', 1)
+          if guard + branch not in text:
+              raise SystemExit('cpu_spoof vDSO guard was not applied')
+          if '#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n#endif' not in text:
+              raise SystemExit('cpu_spoof vDSO include guard was not applied')
           cpu.write_text(text)
           kbuild = Path('KernelSU/kernel/Kbuild')
           text = kbuild.read_text()
