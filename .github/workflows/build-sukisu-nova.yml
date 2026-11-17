@@ -1,4 +1,4 @@
-name: Build Kernel (SukiSU Nova + SUSFS + NoMount + KPM)
+name: NOVA
 
 on:
   push:
