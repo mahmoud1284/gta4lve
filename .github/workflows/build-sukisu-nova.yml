@@ -293,6 +293,243 @@ jobs:
           ! grep -q 'CONFIG_KSU_MANUAL_HOOK' KernelSU/kernel/Kconfig
           echo "Nova native hooks verified"
 
+      # Nova's syscall dispatcher and its reboot supercall probe assume the
+      # pt_regs syscall ABI: table entries named "__arm64_sys_*" that receive a
+      # single pt_regs pointer. Kernel 4.14 uses the raw-argument ABI: table
+      # entries are plain C functions named "sys_*" and entry.S __sys_trace
+      # restores x0..x7 and blr's them directly. Without this adaptation the
+      # dispatcher is never installed ("__arm64_sys_ni_syscall" does not exist),
+      # every execve/faccessat/newfstatat/setresuid hook stays dead, the reboot
+      # kprobe never registers, and the manager app reports "not installed".
+      - name: Fix Nova dispatcher and reboot probe for the 4.14 raw syscall ABI
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          # 1) syscall_hook.h: invoke the original pre-4.17 table entry by
+          #    replaying the frame's argument registers into x0..x5.
+          p = Path('KernelSU/kernel/hook/syscall_hook.h')
+          t = p.read_text()
+          if '#include <linux/version.h>' not in t:
+              anchor = '#include <asm/syscall.h>\n'
+              assert t.count(anchor) == 1
+              t = t.replace(anchor, anchor + '#include <linux/version.h>\n', 1)
+          extern = 'extern syscall_fn_t *ksu_syscall_table;\n'
+          assert t.count(extern) == 1, 'syscall_hook.h table extern not found uniquely'
+          if 'ksu_call_syscall_orig' not in t:
+              helper = extern + '''
+          // Pre-4.17 arm64 syscall table entries are plain C functions invoked
+          // with the raw user arguments in x0..x5 (entry.S restores the argument
+          // registers before blr), not with a pt_regs pointer. Hooks reached
+          // through the dispatcher still receive the real frame
+          // (task_pt_regs(current)), so the original entry is invoked by
+          // replaying the frame's argument registers into x0..x5. Excess
+          // register arguments are ignored by the callee, so one typed call
+          // covers every hooked entry
+          // (execve/execveat/faccessat/newfstatat/setresuid). On pt_regs-ABI
+          // kernels the table entry is called directly with the frame.
+          #if defined(__aarch64__) && LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
+          typedef long (*ksu_raw_syscall6_t)(unsigned long, unsigned long, unsigned long,
+                                             unsigned long, unsigned long, unsigned long);
+          static inline long ksu_call_syscall_orig(int nr, const struct pt_regs *regs)
+          {
+              return ((ksu_raw_syscall6_t)ksu_syscall_table[nr])(regs->regs[0], regs->regs[1],
+                                                                 regs->regs[2], regs->regs[3],
+                                                                 regs->regs[4], regs->regs[5]);
+          }
+          #else
+          #define ksu_call_syscall_orig(nr, regs) (ksu_syscall_table[(nr)]((regs)))
+          #endif
+          '''
+              t = t.replace(extern, helper, 1)
+          p.write_text(t)
+          assert 'ksu_call_syscall_orig' in p.read_text()
+          assert '#include <linux/version.h>' in p.read_text()
+          PYTHON
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          # 2) hook/arm64/syscall_hook.c: resolve the 4.14 ni_syscall symbol and
+          #    recover the real pt_regs frame in the dispatcher.
+          p = Path('KernelSU/kernel/hook/arm64/syscall_hook.c')
+          t = p.read_text()
+          anchor = '#include <linux/mutex.h>\n'
+          assert t.count(anchor) == 1
+          if '#include <linux/version.h>' not in t:
+              t = t.replace(anchor, anchor + '#include <linux/version.h>\n'
+                                       '#include <linux/sched/task_stack.h>\n'
+                                       '#include <linux/spinlock.h>\n', 1)
+
+          old = '    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook("__arm64_sys_ni_syscall");'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)\n'
+                 '    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook("__arm64_sys_ni_syscall");\n'
+                 '#else\n'
+                 '    /* Pre-4.17 table entries use the raw-ABI sys_* names; the\n'
+                 '     * __arm64_sys_* prefix only exists with the pt_regs syscall ABI. */\n'
+                 '    ni_syscall = (unsigned long)ksu_resolve_symbol_for_functable_hook("sys_ni_syscall");\n'
+                 '#endif')
+          assert t.count(old) == 1, 'ni_syscall lookup not found'
+          t = t.replace(old, new, 1)
+
+          old = '''static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
+          {
+              if (regs->syscallno != ksu_dispatcher_nr)
+                  return -ENOSYS;
+
+              int orig_nr = (int)PT_REGS_ORIG_SYSCALL(regs);
+
+              if (regs->syscallno == orig_nr)
+                  return -ENOSYS;
+
+              // Restore registers to original state before dispatching
+              ((struct pt_regs *)regs)->syscallno = orig_nr;
+              PT_REGS_ORIG_SYSCALL((struct pt_regs *)regs) = orig_nr;
+          '''
+          new = '''static long __nocfi ksu_syscall_dispatcher(const struct pt_regs *regs)
+          {
+          #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+              struct pt_regs *frame = (struct pt_regs *)regs;
+          #else
+              /* Pre-4.17 arm64 dispatches table entries with the raw user
+               * arguments (entry.S __sys_trace restores x0..x7 and blr's the
+               * entry), so the value we receive is the first user argument,
+               * not pt_regs. The real frame lives at the top of the kernel
+               * stack and still holds the user arguments plus the dispatcher
+               * syscallno written by our sys_enter tracepoint handler. */
+              struct pt_regs *frame = task_pt_regs(current);
+          #endif
+
+              if (frame->syscallno != ksu_dispatcher_nr)
+                  return -ENOSYS;
+
+              int orig_nr = (int)PT_REGS_ORIG_SYSCALL(frame);
+
+              if (frame->syscallno == orig_nr)
+                  return -ENOSYS;
+
+              // Restore registers to original state before dispatching
+              frame->syscallno = orig_nr;
+              PT_REGS_ORIG_SYSCALL(frame) = orig_nr;
+          '''
+          assert t.count(old) == 1, 'dispatcher prologue not found'
+          t = t.replace(old, new, 1)
+
+          old = '''    if (likely(orig_nr >= 0 && orig_nr < __NR_syscalls)) {
+              ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
+              if (likely(fn))
+                  return fn(orig_nr, regs);
+          }'''
+          new = '''    if (likely(orig_nr >= 0 && orig_nr < __NR_syscalls)) {
+              ksu_syscall_hook_fn fn = READ_ONCE(syscall_hooks[orig_nr]);
+              if (likely(fn))
+                  return fn(orig_nr, frame);
+          }'''
+          assert t.count(old) == 1, 'dispatcher fn call not found'
+          t = t.replace(old, new, 1)
+          p.write_text(t)
+          assert 'task_pt_regs(current)' in p.read_text()
+          assert '"sys_ni_syscall"' in p.read_text()
+          PYTHON
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          # 3) Call the original entry through the raw-ABI helper everywhere a
+          #    hook falls back to ksu_syscall_table[nr](regs).
+          pat = re.compile(r'ksu_syscall_table\[([A-Za-z_0-9]+)\]\(regs\)')
+          expected = {
+              'KernelSU/kernel/feature/sucompat.c': 6,
+              'KernelSU/kernel/hook/syscall_event_bridge.c': 4,
+              'KernelSU/kernel/preinit/preinit.c': 2,
+          }
+          for name, want in expected.items():
+              p = Path(name)
+              t = p.read_text()
+              t, n = pat.subn(lambda m: 'ksu_call_syscall_orig(%s, regs)' % m.group(1), t)
+              assert n == want, '%s: %d original calls found, expected %d' % (name, n, want)
+              p.write_text(t)
+          PYTHON
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          # 4) The reboot supercall probe: correct symbol name and raw ABI on 4.14.
+          p = Path('KernelSU/kernel/include/arch.h')
+          t = p.read_text()
+          old = '#define REBOOT_SYMBOL "__arm64_sys_reboot"'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)\n'
+                 '#define REBOOT_SYMBOL "__arm64_sys_reboot"\n'
+                 '#else\n'
+                 '/* Pre-4.17 syscall entries use the raw-ABI sys_* names. */\n'
+                 '#define REBOOT_SYMBOL "sys_reboot"\n'
+                 '#endif')
+          assert t.count(old) == 1, 'REBOOT_SYMBOL not found'
+          t = t.replace(old, new, 1)
+          p.write_text(t)
+          assert '"sys_reboot"' in p.read_text()
+
+          p = Path('KernelSU/kernel/supercall/supercall.c')
+          t = p.read_text()
+          old = '''    struct pt_regs *real_regs = PT_REAL_REGS(regs);
+          int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
+          int magic2 = (int)PT_REGS_PARM2(real_regs);
+          '''
+          new = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+          struct pt_regs *real_regs = PT_REAL_REGS(regs);
+          int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
+          int magic2 = (int)PT_REGS_PARM2(real_regs);
+          #else
+          /* Pre-4.17 sys_reboot receives the raw user arguments directly. */
+          int magic1 = (int)PT_REGS_SYSCALL_PARM1(regs);
+          int magic2 = (int)PT_REGS_PARM2(regs);
+          #endif
+          '''
+          assert t.count(old) == 1, 'reboot magic block not found'
+          t = t.replace(old, new, 1)
+          old = '        unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)\n'
+                 '        unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);\n'
+                 '#else\n'
+                 '        unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(regs);\n'
+                 '#endif')
+          assert t.count(old) == 1, 'reboot arg4 not found'
+          t = t.replace(old, new, 1)
+          p.write_text(t)
+          assert 'PT_REGS_SYSCALL_PARM1(regs)' in p.read_text()
+          PYTHON
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          # 5) seccomp_cache.c shadows struct seccomp_filter with a layout that
+          #    only matches kernels with the action cache (5.15+). On this 4.14
+          #    kernel the real filter is 24 bytes, so filter->cache would write
+          #    past the allocation and corrupt slab memory: make it a no-op.
+          p = Path('KernelSU/kernel/infra/seccomp_cache.c')
+          t = p.read_text()
+          guard = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)\n'
+                   '    /* The seccomp action cache only exists from 5.15 on. The shadowed\n'
+                   '     * struct layout above does not match the real filter here, so\n'
+                   '     * writing to it would corrupt slab memory: treat it as absent. */\n'
+                   '    return;\n'
+                   '#endif\n')
+          for fn in ('void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)\n{\n',
+                     'void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)\n{\n'):
+              assert t.count(fn) == 1, 'seccomp cache fn not found: %r' % fn
+              if 'KERNEL_VERSION(5, 15, 0)' not in t:
+                  t = t.replace(fn, fn + guard, 1)
+          p.write_text(t)
+          assert p.read_text().count('KERNEL_VERSION(5, 15, 0)') == 2
+          PYTHON
+          test "$(grep -c 'ksu_call_syscall_orig' KernelSU/kernel/feature/sucompat.c)" -eq 6
+          test "$(grep -c 'ksu_call_syscall_orig' KernelSU/kernel/hook/syscall_event_bridge.c)" -eq 4
+          test "$(grep -c 'ksu_call_syscall_orig' KernelSU/kernel/preinit/preinit.c)" -eq 2
+          grep -q '"sys_ni_syscall"' KernelSU/kernel/hook/arm64/syscall_hook.c
+          grep -q 'task_pt_regs(current)' KernelSU/kernel/hook/arm64/syscall_hook.c
+          grep -q 'ksu_raw_syscall6_t' KernelSU/kernel/hook/syscall_hook.h
+          grep -q '"sys_reboot"' KernelSU/kernel/include/arch.h
+          echo "4.14 raw syscall ABI fixes applied"
+
       # SUSFS appends fields to task_struct and vfsmount. That changes the genksyms CRC of
       # ~150 exported symbols (module_layout, fput, dev_err, ...) so the stock vendor
       # modules (mali_gondul, sprd_camera) are rejected and the tablet bootloops.
