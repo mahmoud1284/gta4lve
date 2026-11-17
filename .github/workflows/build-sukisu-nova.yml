@@ -1,4 +1,4 @@
-name: Build Kernel (SukiSU Nova + SUSFS + NoMount + KPM)
+name: NOVA
 
 on:
   push:
@@ -587,12 +587,18 @@ jobs:
           seccomp.write_text(text)
           wrapper = Path('KernelSU/kernel/infra/file_wrapper.c')
           text = wrapper.read_text()
-          legacy = '// There is no anon_inode_create_getfile before 5.16'
-          compat_marker = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\n'
-                           'static struct vfsmount *anon_inode_mnt __read_mostly;\n'
-                           'static struct file *ksu_anon_inode_create_getfile_compat')
-          if legacy in text and compat_marker not in text:
-              compat = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\n'
+          # Upstream chain: #if >=6.8 / #elif >=5.16 / #else <backport of anon_inode_create_getfile>.
+          # On 4.14 replace the whole #else branch (up to its closing #endif) with a plain
+          # anon_inode_getfile() wrapper, keeping a single #else/#endif pair.
+          legacy = '#else\n// There is no anon_inode_create_getfile before 5.16'
+          compat_marker = '/* KSU_4_14_ANON_INODE_COMPAT */'
+          if compat_marker not in text:
+              start = text.find(legacy)
+              end_marker = '#endif\n\nint ksu_install_file_wrapper'
+              end = text.find(end_marker, start)
+              if text.count(legacy) != 1 or start < 0 or end < 0:
+                  raise SystemExit('file_wrapper anon inode legacy block not found uniquely')
+              compat = ('#else\n' + compat_marker + '\n'
                         'static struct vfsmount *anon_inode_mnt __read_mostly;\n'
                         'static struct file *ksu_anon_inode_create_getfile_compat(const char *name,\n'
                         '                                                         const struct file_operations *fops,\n'
@@ -600,12 +606,8 @@ jobs:
                         '                                                         const struct inode *context_inode)\n'
                         '{\n'
                         '    return anon_inode_getfile(name, fops, priv, flags);\n'
-                        '}\n#else\n')
-              text = text.replace(legacy, compat + legacy, 1)
-              suffix = '\n}\n#endif\n\nint ksu_install_file_wrapper'
-              if text.count(suffix) != 1:
-                  raise SystemExit('file_wrapper anon inode fallback end not found uniquely')
-              text = text.replace(suffix, '\n}\n#endif\n#endif\n\nint ksu_install_file_wrapper', 1)
+                        '}\n')
+              text = text[:start] + compat + text[end:]
           if compat_marker not in text:
               raise SystemExit('file_wrapper 4.14 anon inode compatibility was not applied')
           text = text.replace(
@@ -891,8 +893,8 @@ jobs:
           void ksu_selinux_hide_handle_post_fs_data(void) { }
           ''')
           compat_h = root / 'kernel_compat.h'
-          compat_h.write_text('''#ifndef __KSU_H_KERNEL_COMPAT
-          #define __KSU_H_KERNEL_COMPAT
+          compat_h.write_text('''#ifndef __KSU_KERNEL_COMPAT_414_H
+          #define __KSU_KERNEL_COMPAT_414_H
           #include <linux/fs.h>
           #include <linux/version.h>
           #include <linux/uaccess.h>
