@@ -480,8 +480,11 @@ jobs:
               int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
               int magic2 = (int)PT_REGS_PARM2(real_regs);
           #else
-              /* Pre-4.17 sys_reboot receives the raw user arguments directly. */
-              int magic1 = (int)PT_REGS_SYSCALL_PARM1(regs);
+              /* Pre-4.17 sys_reboot receives the raw user arguments directly, and this is a
+               * kprobe frame taken at the function entry: x0..x3 hold the arguments.
+               * orig_x0 is only written by el0_svc for the syscall entry frame, so
+               * PT_REGS_SYSCALL_PARM1() would read stale stack data here. */
+              int magic1 = (int)PT_REGS_PARM1(regs);
               int magic2 = (int)PT_REGS_PARM2(regs);
           #endif
           '''
@@ -496,7 +499,8 @@ jobs:
           assert t.count(old) == 1, 'reboot arg4 not found'
           t = t.replace(old, new, 1)
           p.write_text(t)
-          assert 'PT_REGS_SYSCALL_PARM1(regs)' in p.read_text()
+          assert 'int magic1 = (int)PT_REGS_PARM1(regs);' in p.read_text()
+          assert 'int magic1 = (int)PT_REGS_SYSCALL_PARM1(regs);' not in p.read_text()
           PYTHON
           python3 - <<'PYTHON'
           from pathlib import Path
