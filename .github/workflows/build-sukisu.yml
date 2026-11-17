@@ -536,60 +536,26 @@ jobs:
           text = text.replace(
               '                if (head < (struct hlist_head *)heads_addr || head >= head_end) {',
               '                if (head < (struct list_head *)heads_addr || head >= head_end) {')
-          old = '''                if (head->first) {
-                    selected_entry = hlist_entry(head->first, struct security_hook_list, list);
-                    selected_slot = (void **)((char *)selected_entry + hook->hook_offset);
-                    selected_origin = *selected_slot;
-                } else {
-                    selected_entry = &hook->list;
-                    hook->list.head = head;
-                    hook->list.list.next = NULL;
-                    hook->list.list.pprev = &head->first;
-                    hook->list.lsm = "ksu";
-                    *(void **)((char *)selected_entry + hook->hook_offset) = hook->replacement;
-                    selected_slot = (void **)&head->first;
-                    selected_origin = NULL;
-                }'''
-          new = '''                if (head->next != head) {
-                    selected_entry = list_first_entry(head, struct security_hook_list, list);
-                    selected_slot = (void **)((char *)selected_entry + hook->hook_offset);
-                    selected_origin = *selected_slot;
-                } else {
-                    /* 4.14 stores LSM hooks in list_head, not hlist_head. */
-                    selected_entry = &hook->list;
-                    hook->list.head = head;
-                    hook->list.list.next = head->next;
-                    hook->list.list.prev = head;
-                    hook->list.lsm = "ksu";
-                    if (head->next != head)
-                        head->next->prev = &hook->list.list;
-                    *(void **)((char *)selected_entry + hook->hook_offset) = hook->replacement;
-                    selected_slot = (void **)&head->next;
-                    selected_origin = NULL;
-                }'''
-          if old not in text:
+          if 'head->first' not in text:
               raise SystemExit('Nova 4.14 LSM hlist block not found')
-          text = text.replace(old, new, 1)
-          old = '''        slot = (void **)&hook->list.head->first;
-          pr_info("unhook patch head->first\\n");'''
-          new = '''        slot = (void **)&hook->list.head->next;
-          pr_info("unhook patch list head\\n");'''
-          if old not in text:
-              raise SystemExit('Nova 4.14 LSM unhook block not found')
-          text = text.replace(old, new, 1)
-          marker = '''    if (ksu_lsm_hook_patch_slot(slot, hook->original)) {
-          pr_err("lsm_hook: failed to restore %s\\n", hook->head_name ?: "unknown");'''
-          replacement = '''    if (hook->entry == &hook->list) {
-          /* Restore the list head and repair the successor's back link. */
-          if (hook->list.list.next != hook->list.head)
-            hook->list.list.next->prev = hook->list.head;
-          hook->original = hook->list.list.next;
+          text = text.replace('if (head->first) {', 'if (head->next != head) {', 1)
+          text = text.replace('hlist_entry(head->first, struct security_hook_list, list)', 'list_first_entry(head, struct security_hook_list, list)', 1)
+          text = text.replace('hook->list.list.next = NULL;', 'hook->list.list.next = head->next;', 1)
+          text = text.replace('hook->list.list.pprev = &head->first;', 'hook->list.list.prev = head;', 1)
+          text = text.replace('selected_slot = (void **)&head->first;', 'selected_slot = (void **)&head->next;', 1)
+          text = text.replace('slot = (void **)&hook->list.head->first;', 'slot = (void **)&hook->list.head->next;', 1)
+          text = text.replace('pr_info("unhook patch head->first\\n");', 'pr_info("unhook patch list head\\n");', 1)
+          text = text.replace('pr_info("patch head->first\\n");', 'pr_info("patch list head\\n");', 1)
+          marker = '    if (ksu_lsm_hook_patch_slot(slot, hook->original)) {'
+          if 'if (hook->entry == &hook->list)' not in text and marker in text:
+              replacement = '''    if (hook->entry == &hook->list) {
+              /* Restore the list head and repair the successor's back link. */
+              if (hook->list.list.next != hook->list.head)
+                  hook->list.list.next->prev = hook->list.head;
+              hook->original = hook->list.list.next;
           }
-          if (ksu_lsm_hook_patch_slot(slot, hook->original)) {
-          pr_err("lsm_hook: failed to restore %s\\n", hook->head_name ?: "unknown");'''
-          if marker not in text:
-              raise SystemExit('Nova 4.14 LSM restore marker not found')
-          text = text.replace(marker, replacement, 1)
+          if (ksu_lsm_hook_patch_slot(slot, hook->original)) {'''
+              text = text.replace(marker, replacement, 1)
           lsm.write_text(text)
           assert '#include <linux/pgtable.h>' not in sucompat.read_text()
           assert 'list_for_each_entry (entry, head, list)' in lsm.read_text()

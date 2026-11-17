@@ -1,0 +1,1032 @@
+name: Build Kernel (SukiSU Nova + SUSFS + NoMount + KPM)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      bypass_module_crc:
+        description: "Let the kernel load vendor modules even if their symbol CRCs differ (use only if the CRC check step reports mismatches)"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build kernel with SukiSU Nova, SUSFS, NoMount and KPM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libyaml-dev \
+            gcc-aarch64-linux-gnu python3 git patch curl
+
+      - name: Get toolchains (AOSP clang r383902 = clang 11.0.1)
+        run: |
+          git clone --depth 1 -b android11-dev https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 clang-prebuilt
+          ls clang-prebuilt | grep r383902
+          echo "$PWD/clang-prebuilt/clang-r383902/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler (must be AOSP clang 11)
+        run: |
+          which clang
+          clang --version | head -1
+          clang --version | head -1 | grep -q "clang version 11"
+          ld.lld --version | head -1
+          aarch64-linux-gnu-ar --version | head -1
+          aarch64-linux-gnu-objdump --version | head -1
+
+      # Pin the exact latest Nova commit known when this workflow was authored.
+      # Do not use a moving branch in a kernel build.
+      - name: Integrate SukiSU Nova (pinned)
+        run: |
+          set -euo pipefail
+          NOVA_COMMIT=c60f21b9e00e35e898f8d21e0612465b76b9beec
+          git clone --filter=blob:none https://github.com/SukiSU-Nova/SukiSU-Nova.git KernelSU
+          git -C KernelSU checkout "$NOVA_COMMIT"
+          test "$(git -C KernelSU rev-parse HEAD)" = "$NOVA_COMMIT"
+          git -C KernelSU log -1 --format='SukiSU Nova commit %H %ad %s' --date=short | tee -a "$GITHUB_STEP_SUMMARY"
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+          grep -q "kernelsu" drivers/Makefile || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          if ! grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig; then
+            awk '/^endmenu/ { last = NR } { l[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"drivers/kernelsu/Kconfig\""; print l[i] } }' \
+              drivers/Kconfig > drivers/Kconfig.tmp && mv drivers/Kconfig.tmp drivers/Kconfig
+          fi
+          # Nova's KPM already selects the correct task_struct member for 4.14.
+          grep -q 'KERNEL_VERSION(4, 19, 0)' KernelSU/kernel/extension/kpm/super_access.c
+          grep -q 'pids\[PIDTYPE_PID\]\.pid' KernelSU/kernel/extension/kpm/super_access.c
+          # SukiSU's Makefile injects get_cred_rcu() into include/linux/cred.h while it is
+          # being parsed, *after* it already decided the helper is missing -> the first build
+          # would define it twice. Inject it ourselves, before any build.
+          if ! grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h; then
+            python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('include/linux/cred.h'); s = p.read_text()
+          fn = ('static inline const struct cred *get_cred_rcu(const struct cred *cred)\n'
+                '{\n\tstruct cred *nonconst_cred = (struct cred *) cred;\n\tif (!cred)\n\t\treturn NULL;\n'
+                '\tif (!atomic_inc_not_zero(&nonconst_cred->usage))\n\t\treturn NULL;\n'
+                '\tvalidate_creds(cred);\n\treturn cred;\n}\n\n')
+          key = 'static inline void put_cred'
+          assert s.count(key) == 1
+          p.write_text(s.replace(key, fn + key))
+          PYTHON
+          fi
+          grep -Eq '^static inline const struct cred \*get_cred_rcu' include/linux/cred.h
+          grep -q 'REPO_OWNER  := SukiSU-Nova' KernelSU/kernel/Kbuild
+          grep -q '^config KSU_MANUAL_SU$' KernelSU/kernel/Kconfig
+          # Nova's syscall hook header has no ARM64 typedef on this old kernel API.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          hook = Path('KernelSU/kernel/hook/syscall_hook.h')
+          text = hook.read_text()
+          if '#elif defined(__aarch64__)' not in text:
+              marker = '#elif defined(__riscv)\n'
+              assert text.count(marker) == 1, 'syscall_fn_t architecture marker not found uniquely'
+              text = text.replace(marker,
+                                  '#elif defined(__aarch64__)\n'
+                                  'typedef long (*syscall_fn_t)(const struct pt_regs *);\n'
+                                  '#elif defined(__riscv)\n', 1)
+              hook.write_text(text)
+          assert '#elif defined(__aarch64__)' in hook.read_text()
+
+          init = Path('KernelSU/kernel/core/init.c')
+          text = init.read_text()
+          if '#ifdef MODULE_IMPORT_NS\n' not in text:
+              old = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+          MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+          #else
+          MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+          #endif'''
+              new = '#ifdef MODULE_IMPORT_NS\n' + old + '\n#endif'
+              assert text.count(old) == 1, 'MODULE_IMPORT_NS block not found uniquely'
+              init.write_text(text.replace(old, new, 1))
+          assert '#ifdef MODULE_IMPORT_NS\n' in init.read_text()
+          PYTHON
+          grep -q '#elif defined(__aarch64__)' KernelSU/kernel/hook/syscall_hook.h
+          grep -q '^#ifdef MODULE_IMPORT_NS$' KernelSU/kernel/core/init.c
+          echo "SukiSU Nova integrated"
+
+      - name: Integrate SUSFS (kernel-4.14)
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/susfs4ksu
+          git clone --depth 1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+          # The SUSFS repository keeps its KernelSU Kconfig additions in a separate
+          # patch. Apply only that Kconfig menu; the patch's legacy KernelSU Makefile
+          # edits are not compatible with Nova and are intentionally not applied.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          patch = Path('/tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch').read_text()
+          lines = patch.splitlines()
+          start = next(i for i, line in enumerate(lines) if line == '+menu "KernelSU - SUSFS"')
+          end = next(i for i in range(start + 1, len(lines)) if lines[i] == '+endmenu')
+          block = '\n'.join(line[1:] for line in lines[start:end + 1]) + '\n\n'
+          kconfig = Path('KernelSU/kernel/Kconfig')
+          text = kconfig.read_text()
+          if 'config KSU_SUSFS\n' not in text:
+              marker = 'config KSU_MANUAL_SU\n'
+              assert text.count(marker) == 1, 'Nova KSU_MANUAL_SU marker not found uniquely'
+              kconfig.write_text(text.replace(marker, block + marker, 1))
+          assert 'config KSU_SUSFS\n' in kconfig.read_text()
+          PYTHON
+          grep -q '^config KSU_SUSFS$' KernelSU/kernel/Kconfig
+          cp -av /tmp/susfs4ksu/kernel_patches/fs/. fs/
+          mkdir -p include/linux
+          cp -av /tmp/susfs4ksu/kernel_patches/include/linux/. include/linux/
+          # drop the stale 3-line susfs_def.h include left in fs/namei.c by an earlier attempt
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('fs/namei.c'); s = p.read_text()
+          s = s.replace('#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n', '')
+          p.write_text(s)
+          PYTHON
+          # The patch has 5 known-conflicting header/include hunks on this vendor tree;
+          # they are re-applied by the script below. Everything else must apply.
+          patch -p1 --forward --batch < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.14.patch 2>&1 | tee susfs_patch.log || true
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import re
+
+          # fs/namei.c: ensure susfs include exists
+          p = Path('fs/namei.c')
+          s = p.read_text()
+          if '#if defined(CONFIG_KSU_SUSFS_SUS_PATH)' not in s:
+              s = s.replace('#include <linux/uaccess.h>\n',
+                            '#include <linux/uaccess.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_PATH) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              p.write_text(s)
+
+          # fs/proc/task_mmu.c: ensure sus_kstat include/defs
+          p = Path('fs/proc/task_mmu.c')
+          s = p.read_text()
+          if 'CONFIG_KSU_SUSFS_SUS_KSTAT' in s and '#include <linux/susfs_def.h>' not in s:
+              inc = '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n'
+              if '#include <linux/ctype.h>\n' in s:
+                  s = s.replace('#include <linux/ctype.h>\n', '#include <linux/ctype.h>\n' + inc, 1)
+              elif '#include <linux/mm_inline.h>\n' in s:
+                  s = s.replace('#include <linux/mm_inline.h>\n', '#include <linux/mm_inline.h>\n' + inc, 1)
+              else:
+                  s = '#include <linux/susfs_def.h>\n' + s
+              p.write_text(s)
+
+          # fs/namespace.c: ensure susfs top-level defs required by susfs 1.5.5 patches
+          p = Path('fs/namespace.c')
+          s = p.read_text()
+          if 'static DEFINE_IDA(susfs_mnt_id_ida)' not in s:
+              if '#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif' not in s:
+                  s = s.replace('#include <linux/fslog.h>\n', '#include <linux/fslog.h>\n#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_TRY_UMOUNT)\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              block = '\n'
+              block += '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n'
+              block += 'extern bool susfs_is_current_ksu_domain(void);\n'
+              block += 'extern bool susfs_is_current_zygote_domain(void);\n'
+              block += '\n'
+              block += 'static DEFINE_IDA(susfs_mnt_id_ida);\n'
+              block += 'static DEFINE_IDA(susfs_mnt_group_ida);\n'
+              block += '\n'
+              block += 'static int susfs_mnt_id_start = DEFAULT_SUS_MNT_ID;\n'
+              block += 'static int susfs_mnt_group_start = DEFAULT_SUS_MNT_GROUP_ID;\n'
+              block += '\n'
+              block += '#define CL_ZYGOTE_COPY_MNT_NS BIT(24) /* used by copy_mnt_ns() */\n'
+              block += '#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */\n'
+              block += '#endif\n'
+              block += '\n'
+              block += '#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT\n'
+              block += 'extern void susfs_auto_add_sus_ksu_default_mount(const char __user *to_pathname);\n'
+              block += 'bool susfs_is_auto_add_sus_ksu_default_mount_enabled = true;\n'
+              block += '#endif\n'
+              block += '#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT\n'
+              block += 'extern int susfs_auto_add_sus_bind_mount(const char *pathname, struct path *path_target);\n'
+              block += 'bool susfs_is_auto_add_sus_bind_mount_enabled = true;\n'
+              block += '#endif\n'
+              block += '#ifdef CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT\n'
+              block += 'extern void susfs_auto_add_try_umount_for_bind_mount(struct path *path);\n'
+              block += 'bool susfs_is_auto_add_try_umount_for_bind_mount_enabled = true;\n'
+              block += '#endif\n'
+              if '#include "internal.h"\n' not in s:
+                  raise SystemExit('namespace.c internal.h include not found')
+              s = s.replace('#include "internal.h"\n', '#include "internal.h"\n' + block + '\n', 1)
+              p.write_text(s)
+
+          # fs/readdir.c: compat_fillonedir sus_path filter
+          p = Path('fs/readdir.c')
+          s = p.read_text()
+          if 'compat_fillonedir' in s and 'susfs_sus_ino_for_filldir64(' not in s:
+              old = '\tif (buf->result)\n\t\treturn -EINVAL;\n\td_ino = ino;\n\tif (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {'
+              new = '\tif (buf->result)\n\t\treturn -EINVAL;\n#ifdef CONFIG_KSU_SUSFS_SUS_PATH\n\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) && susfs_sus_ino_for_filldir64(ino)) {\n\t\treturn 0;\n\t}\n#endif\n\td_ino = ino;\n\tif (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {'
+              if old in s:
+                  s = s.replace(old, new)
+                  p.write_text(s)
+
+          # fs/notify/fdinfo.c: sus_mount-aware callbacks for this kernel's fdinfo API
+          p = Path('fs/notify/fdinfo.c')
+          s = p.read_text()
+          if 'static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)' not in s:
+              s = s.replace('static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n{',
+                            '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n{\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t(void)file;\n#endif', 1)
+          if 'inotify_fdinfo' in s and 'out_free_pathname:' not in s.split('inotify_fdinfo', 1)[1][:2000]:
+              old = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n\t\t/*\n\t\t * IN_ALL_EVENTS represents all of the mask bits\n\t\t * that we expose to userspace.  There is at\n\t\t * least one bit (FS_EVENT_ON_CHILD) which is\n\t\t * used only internally to the kernel.\n\t\t */\n\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);\n\t\tshow_mark_fhandle(m, inode);\n\t\tseq_putc(m, \'\\n\');\n\t\tiput(inode);\n\t}'
+              new = '\tinode = igrab(mark->connector->inode);\n\tif (inode) {\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n\t\t{\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t\t   mask, mark->ignored_mask);\n\t\t\tshow_mark_fhandle(m, inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t}\n\t}'
+              if old in s:
+                  s = s.replace(old, new)
+              elif 'INODE_STATE_SUS_KSTAT' not in s and 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
+                  # If hunk 4 shape is different, do a targeted insertion before printing normal inotify info.
+                  marker = '\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:%x ",\n\t\t\t   inode_mark->wd, inode->i_ino, inode->i_sb->s_dev,\n\t\t\t   mask, mark->ignored_mask);'
+                  if marker in s:
+                      ins = '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t\tif (likely(current->susfs_task_state & TASK_STRUCT_NON_ROOT_USER_APP_PROC) &&\n\t\t    unlikely(inode->i_state & INODE_STATE_SUS_KSTAT)) {\n\t\t\tstruct path path;\n\t\t\tchar *pathname = kmalloc(PAGE_SIZE, GFP_KERNEL);\n\t\t\tchar *dpath;\n\t\t\tu32 mask = mark->mask & IN_ALL_EVENTS;\n\t\t\tif (!pathname)\n\t\t\t\tgoto out_seq_printf;\n\t\t\tdpath = d_path(&file->f_path, pathname, PAGE_SIZE);\n\t\t\tif (!dpath)\n\t\t\t\tgoto out_free_pathname;\n\t\t\tif (kern_path(dpath, 0, &path))\n\t\t\t\tgoto out_free_pathname;\n\t\t\tseq_printf(m, "inotify wd:%x ino:%lx sdev:%x mask:%x ignored_mask:0 ",\n\t\t\t\t   inode_mark->wd, path.dentry->d_inode->i_ino,\n\t\t\t\t   path.dentry->d_inode->i_sb->s_dev,\n\t\t\t\t   mask);\n\t\t\tshow_mark_fhandle(m, path.dentry->d_inode);\n\t\t\tseq_putc(m, \'\\n\');\n\t\t\tiput(inode);\n\t\t\tpath_put(&path);\n\t\t\tkfree(pathname);\n\t\t\treturn;\nout_free_pathname:\n\t\t\tkfree(pathname);\n\t\t}\nout_seq_printf:\n#endif\n'
+                      s = s.replace(marker, ins + marker, 1)
+          if 'CONFIG_KSU_SUSFS_SUS_MOUNT' in s:
+              s = s.replace('static void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n{',
+                            '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark, struct file *file)\n#else\nstatic void fanotify_fdinfo(struct seq_file *m, struct fsnotify_mark *mark)\n#endif\n{\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n\t(void)file;\n#endif', 1)
+          p.write_text(s)
+
+          # Remove known-resolved reject files and fail on any unexpected rejects.
+          for rej in ['fs/namei.c.rej','fs/namespace.c.rej','fs/proc/task_mmu.c.rej','fs/notify/fdinfo.c.rej','fs/readdir.c.rej']:
+              rp = Path(rej)
+              if rp.exists():
+                  rp.unlink()
+
+          remaining = sorted(str(p) for p in Path('.').rglob('*.rej'))
+          if remaining:
+              print('Remaining SUSFS patch rejects:')
+              for r in remaining:
+                  print(' -', r)
+              raise SystemExit(1)
+
+          # Fail fast if expected SUSFS fixups are missing.
+          checks = [
+              ('fs/namespace.c', 'DEFINE_IDA(susfs_mnt_id_ida)'),
+              ('fs/proc/task_mmu.c', 'CONFIG_KSU_SUSFS_SUS_KSTAT'),
+          ]
+          for path, marker in checks:
+              txt = Path(path).read_text()
+              if marker not in txt:
+                  raise SystemExit(f'Missing expected SUSFS marker {marker} in {path}')
+          task_mmu = Path('fs/proc/task_mmu.c').read_text()
+          if 'INODE_STATE_SUS_KSTAT' in task_mmu and '#include <linux/susfs_def.h>' not in task_mmu:
+              task_mmu = task_mmu.replace('#include <linux/ctype.h>\n',
+                                          '#include <linux/ctype.h>\n#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n#include <linux/susfs_def.h>\n#endif\n', 1)
+              Path('fs/proc/task_mmu.c').write_text(task_mmu)
+          task_mmu = Path('fs/proc/task_mmu.c').read_text()
+          if 'INODE_STATE_SUS_KSTAT' in task_mmu and '#include <linux/susfs_def.h>' not in task_mmu:
+              raise SystemExit('susfs_def.h include missing from fs/proc/task_mmu.c')
+          print('SUSFS integrated with conflict fixups')
+          PYTHON
+          test -f fs/susfs.c && test -f include/linux/susfs.h && test -f include/linux/susfs_def.h
+          echo "SUSFS integrated"
+
+      # Nova wires its syscall/event hooks internally; do not inject the
+      # obsolete Ultra manual-hook API (ksu_handle_*).
+      - name: Verify Nova native hook architecture
+        run: |
+          set -euo pipefail
+          test -f KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_execve_common' KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_faccessat' KernelSU/kernel/hook/syscall_event_bridge.c
+          grep -q 'ksu_hook_newfstatat' KernelSU/kernel/hook/syscall_event_bridge.c
+          ! grep -q 'CONFIG_KSU_MANUAL_HOOK' KernelSU/kernel/Kconfig
+          echo "Nova native hooks verified"
+
+      # SUSFS appends fields to task_struct and vfsmount. That changes the genksyms CRC of
+      # ~150 exported symbols (module_layout, fput, dev_err, ...) so the stock vendor
+      # modules (mali_gondul, sprd_camera) are rejected and the tablet bootloops.
+      # Hiding the fields from genksyms keeps every CRC identical to the stock kernel.
+      - name: Keep vendor module CRCs stable (hide SUSFS fields from genksyms)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          # Fields SUSFS appends to exported structs change genksyms CRCs of ~150 symbols and make the
+          # stock vendor modules (mali_gondul, sprd_camera) fail to load. Hide them from genksyms only:
+          # the compiler still sees them, the CRCs stay identical to the stock kernel.
+          for path, field in (('include/linux/sched.h', '\tu64 susfs_task_state;\n\tu64 susfs_last_fake_mnt_id;\n'),
+                              ('include/linux/mount.h', '\tu64 susfs_mnt_id_backup;\n')):
+              p = Path(path); s = p.read_text()
+              old = '#ifdef CONFIG_KSU_SUSFS\n' + field + '#endif\n'
+              new = '#ifdef CONFIG_KSU_SUSFS\n#ifndef __GENKSYMS__\n' + field + '#endif\n#endif\n'
+              if new in s:
+                  continue
+              assert s.count(old) == 1, 'SUSFS struct field block not found in ' + path
+              p.write_text(s.replace(old, new))
+              print('genksyms-hidden:', path)
+          PYTHON
+          grep -n -B1 -A3 '__GENKSYMS__' include/linux/sched.h include/linux/mount.h
+
+      - name: Integrate NoMount
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/nomount
+          git clone https://github.com/maxsteeel/nomount.git /tmp/nomount
+          git -C /tmp/nomount checkout 7914458ca71dfa3a8c162fa97fdb69332db7a690
+          mkdir -p fs/nomount
+          cp -av /tmp/nomount/kernel/src/. fs/nomount/
+          grep -q 'CONFIG_NOMOUNT' fs/Makefile || printf '\nobj-$(CONFIG_NOMOUNT) += nomount/\n' >> fs/Makefile
+          if ! grep -q 'source "fs/nomount/Kconfig"' fs/Kconfig; then
+            awk '/^endmenu/ { last = NR } { l[NR] = $0 }
+                 END { for (i = 1; i <= NR; i++) { if (i == last) print "source \"fs/nomount/Kconfig\""; print l[i] } }' \
+              fs/Kconfig > fs/Kconfig.tmp && mv fs/Kconfig.tmp fs/Kconfig
+          fi
+          echo "NoMount integrated"
+
+      - name: Enable feature configs
+        run: |
+          set -euo pipefail
+          DEFCONFIG=arch/arm64/configs/gta4lve_eur_open_defconfig
+          # Keep essential device drivers and stock vendor module compatibility.
+          # Remove every previous spelling first, then add exactly one canonical value.
+          sed -i '/^CONFIG_CHARGER_BQ25890=/d; /^# CONFIG_CHARGER_BQ25890 is not set$/d' "$DEFCONFIG"
+          printf '\nCONFIG_CHARGER_BQ25890=y\n' >> "$DEFCONFIG"
+          grep -q '^CONFIG_CHARGER_BQ25890=y$' "$DEFCONFIG"
+          sed -i 's/^CONFIG_JUMP_LABEL=y$/# CONFIG_JUMP_LABEL is not set/' "$DEFCONFIG"
+          grep -q '^# CONFIG_JUMP_LABEL is not set$' "$DEFCONFIG"
+          # Avoid duplicate override warnings for symbols already present in this vendor defconfig.
+          sed -i -E '/^(# )?CONFIG_(KPROBES|KALLSYMS|KALLSYMS_ALL)(=| is not set)/d' "$DEFCONFIG"
+          {
+            echo ""
+            echo "# SukiSU Nova / SUSFS 1.5.5 / NoMount / KPM"
+            echo "CONFIG_KSU=y"
+            # Nova uses its native syscall/event hook implementation.
+            echo "CONFIG_KSU_MANUAL_SU=y"
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
+            # Keep the legacy SUSFS su hook disabled; Nova supplies its own hook path.
+            echo "# CONFIG_KSU_SUSFS_SUS_SU is not set"
+            echo "CONFIG_NOMOUNT=y"
+            echo "CONFIG_KPM=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_KALLSYMS=y"
+            echo "CONFIG_KALLSYMS_ALL=y"
+          } >> "$DEFCONFIG"
+          echo "Feature configs enabled"
+
+      - name: Patch sources for clang 11
+        run: |
+          set -euo pipefail
+          # 1) -fmerge-constants is a GCC-only flag. Skip it for clang.
+          sed -i -E 's|^(KBUILD_CFLAGS[[:space:]]+\+= )\$\(call cc-option,-fmerge-constants\)|\1$(if $(filter clang,$(cc-name)),,$(call cc-option,-fmerge-constants))|' Makefile
+          grep -n "fmerge-constants" Makefile
+          grep -q 'filter clang,$(cc-name)' Makefile
+
+          # 2) Remove bare -Werror from vendor/kernel Makefiles so warnings do not break the build.
+          grep -rlE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64 \
+            | xargs -r sed -i -E 's/(^|[[:space:]])-Werror([[:space:]]|$)/\1\2/g'
+          # This vendor audio Makefile is the last known source of -Werror; Clang 11/18
+          # reports the GCC-only -fmerge-constants diagnostic as an error under it.
+          sed -i 's/[[:space:]]-Werror\([[:space:]]*\)/\1/g' sound/soc/sprd/codec/sprd/fs16xx/Makefile
+          if grep -rE '(^|[[:space:]])-Werror([[:space:]]|$)' --include=Makefile --include=Kbuild sound drivers arch/arm64; then
+            echo "bare -Werror still present"; exit 1
+          fi
+          ! grep -q -- '-Werror' sound/soc/sprd/codec/sprd/fs16xx/Makefile
+
+      - name: Optional - bypass module CRC check
+        if: ${{ github.event.inputs.bypass_module_crc == 'true' }}
+        run: |
+          set -euo pipefail
+          # kernel/module.c check_version(): warn instead of rejecting a module whose
+          # imported-symbol CRC differs. Vermagic stays strict.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          p = Path('kernel/module.c'); s = p.read_text()
+          old = 'pr_warn("%s: disagrees about version of symbol %s\\n",\n\t       info->name, symname);\n\treturn 0;'
+          new = 'pr_warn("%s: disagrees about version of symbol %s (bypassed)\\n",\n\t       info->name, symname);\n\treturn 1;'
+          assert s.count(old) == 1, 'check_version bad_version block not found'
+          p.write_text(s.replace(old, new))
+          PYTHON
+          grep -n "bypassed" kernel/module.c
+
+      - name: Configure kernel
+        shell: bash
+        run: |
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 gta4lve_eur_open_defconfig 2>&1 | tee config.log
+          # Re-assert these symbols after defconfig. This kernel tree has several
+          # vendor config layers; scripts/config makes the intended final state explicit.
+          scripts/config --file .config --enable I2C --enable GPIOLIB --enable CHARGER_BQ25890
+          scripts/config --state I2C --state GPIOLIB --state CHARGER_BQ25890
+          grep -E '^CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS)=' .config
+
+      - name: Check required configs
+        run: |
+          missing=0
+          for sym in CHARGER_BQ25890 I2C GPIOLIB KSU KSU_MANUAL_SU KSU_SUSFS NOMOUNT KPM MODVERSIONS; do
+            state=$(scripts/config --state "$sym" 2>/dev/null || true)
+            if [ "$state" != y ]; then
+              echo "::error::missing CONFIG_${sym}=y (state=${state:-undefined})"
+              missing=1
+            else
+              echo "CONFIG_${sym}=y"
+            fi
+          done
+          if grep -q '^CONFIG_JUMP_LABEL=y$' .config; then
+            echo '::error::CONFIG_JUMP_LABEL must be disabled for vendor module compatibility'
+            missing=1
+          else
+            echo 'CONFIG_JUMP_LABEL is disabled'
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo '--- relevant .config state ---'
+            grep -E '^(# )?CONFIG_(CHARGER_BQ25890|I2C|GPIOLIB|KSU|KSU_MANUAL_SU|KSU_SUSFS|NOMOUNT|KPM|MODVERSIONS|JUMP_LABEL)' .config || true
+            exit 1
+          fi
+          echo "required configs present"
+
+      - name: Prepare kernel build
+        shell: bash
+        run: |
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 prepare
+
+      # Nova no longer uses Ultra's old ksu.o target or its Makefile-time compat injection.
+      # Add the 4.14 path_umount backport before building the composite kernelsu.o target.
+      - name: Apply SukiSU compat edits before the real build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          namespace = Path('fs/namespace.c')
+          s = namespace.read_text()
+          if 'static int can_umount(const struct path *path, int flags)' not in s:
+              marker = 'static bool is_mnt_ns_file'
+              assert s.count(marker) == 1, 'namespace.c insertion marker not found uniquely'
+              compat = '''static int can_umount(const struct path *path, int flags)
+          {
+                  struct mount *mnt = real_mount(path->mnt);
+                  if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+                          return -EINVAL;
+                  if (!may_mount())
+                          return -EPERM;
+                  if (path->dentry != path->mnt->mnt_root)
+                          return -EINVAL;
+                  if (!check_mnt(mnt))
+                          return -EINVAL;
+                  if (mnt->mnt.mnt_flags & MNT_LOCKED)
+                          return -EINVAL;
+                  if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+                          return -EPERM;
+                  return 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+                  struct mount *mnt = real_mount(path->mnt);
+                  int ret;
+                  ret = can_umount(path, flags);
+                  if (!ret)
+                          ret = do_umount(mnt, flags);
+                  dput(path->dentry);
+                  mntput_no_expire(mnt);
+                  return ret;
+          }
+
+          '''
+              namespace.write_text(s.replace(marker, compat + marker, 1))
+
+          internal = Path('fs/internal.h')
+          s = internal.read_text()
+          if 'int path_umount(struct path *path, int flags);' not in s:
+              marker = 'extern void __init mnt_init'
+              assert s.count(marker) == 1, 'internal.h insertion marker not found uniquely'
+              s = s.replace(marker, 'int path_umount(struct path *path, int flags);\n' + marker, 1)
+              internal.write_text(s)
+          assert 'int path_umount(struct path *path, int flags)' in namespace.read_text()
+          assert 'int path_umount(struct path *path, int flags);' in internal.read_text()
+          PYTHON
+          # Nova's current LSM walker assumes newer hlist-based security hooks.
+          # Kernel 4.14 stores security_hook_list entries in ordinary list_head
+          # lists, so adapt only the pre-6.12 path without changing newer kernels.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+
+          sucompat = Path('KernelSU/kernel/feature/sucompat.c')
+          text = sucompat.read_text()
+          text = text.replace('#include <linux/pgtable.h>\n', '')
+          sucompat.write_text(text)
+
+          lsm = Path('KernelSU/kernel/hook/lsm_hook.c')
+          text = lsm.read_text()
+          text = text.replace('    struct hlist_head *head;\n', '    struct list_head *head;\n')
+          text = text.replace(
+              '    head = (struct hlist_head *)heads_addr;\n'
+              '    struct hlist_head *head_end = (struct hlist_head *)(heads_addr + heads_size);\n',
+              '    head = (struct list_head *)heads_addr;\n'
+              '    struct list_head *head_end = (struct list_head *)(heads_addr + heads_size);\n')
+          text = text.replace('        hlist_for_each_entry (entry, head, list) {',
+                              '        list_for_each_entry (entry, head, list) {')
+          text = text.replace(
+              '                if (head < (struct hlist_head *)heads_addr || head >= head_end) {',
+              '                if (head < (struct list_head *)heads_addr || head >= head_end) {')
+          if 'head->first' not in text:
+              raise SystemExit('Nova 4.14 LSM hlist block not found')
+          text = text.replace('if (head->first) {', 'if (head->next != head) {', 1)
+          text = text.replace('hlist_entry(head->first, struct security_hook_list, list)', 'list_first_entry(head, struct security_hook_list, list)', 1)
+          text = text.replace('hook->list.list.next = NULL;', 'hook->list.list.next = head->next;', 1)
+          text = text.replace('hook->list.list.pprev = &head->first;', 'hook->list.list.prev = head;', 1)
+          text = text.replace('selected_slot = (void **)&head->first;', 'selected_slot = (void **)&head->next;', 1)
+          text = text.replace('slot = (void **)&hook->list.head->first;', 'slot = (void **)&hook->list.head->next;', 1)
+          text = text.replace('pr_info("unhook patch head->first\\n");', 'pr_info("unhook patch list head\\n");', 1)
+          text = text.replace('pr_info("patch head->first\\n");', 'pr_info("patch list head\\n");', 1)
+          marker = '    if (ksu_lsm_hook_patch_slot(slot, hook->original)) {'
+          if 'if (hook->entry == &hook->list)' not in text and marker in text:
+              replacement = '''    if (hook->entry == &hook->list) {
+              /* Restore the list head and repair the successor's back link. */
+              if (hook->list.list.next != hook->list.head)
+                  hook->list.list.next->prev = hook->list.head;
+              hook->original = hook->list.list.next;
+          }
+          if (ksu_lsm_hook_patch_slot(slot, hook->original)) {'''
+              text = text.replace(marker, replacement, 1)
+          lsm.write_text(text)
+          assert '#include <linux/pgtable.h>' not in sucompat.read_text()
+          assert 'list_for_each_entry (entry, head, list)' in lsm.read_text()
+          assert 'head->first' not in lsm.read_text()
+          assert 'list->pprev' not in lsm.read_text()
+          PYTHON
+          # Nova's event queue uses the post-4.14 __poll_t spelling and keeps
+          # epoll constants out of linux/poll.h on this vendor kernel.
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          for name in ('KernelSU/kernel/infra/event_queue.h',
+                       'KernelSU/kernel/infra/event_queue.c'):
+              p = Path(name)
+              text = p.read_text()
+              if '#include <uapi/linux/eventpoll.h>\n' not in text:
+                  text = text.replace('#include <linux/poll.h>\n',
+                                      '#include <linux/poll.h>\n#include <uapi/linux/eventpoll.h>\n', 1)
+              text = text.replace('__poll_t ksu_event_queue_poll',
+                                  'unsigned int ksu_event_queue_poll')
+              text = text.replace('    __poll_t mask = 0;',
+                                  '    unsigned int mask = 0;')
+              p.write_text(text)
+          seccomp = Path('KernelSU/kernel/infra/seccomp_cache.c')
+          text = seccomp.read_text()
+          marker = '#include "infra/seccomp_cache.h"\n'
+          fallback = (marker + '\n#ifndef SECCOMP_ARCH_NATIVE_NR\n'
+                      '#define SECCOMP_ARCH_NATIVE_NR __NR_syscalls\n#endif\n')
+          if '#define SECCOMP_ARCH_NATIVE_NR __NR_syscalls' not in text:
+              if text.count(marker) != 1:
+                  raise SystemExit('seccomp cache include marker not found uniquely')
+              text = text.replace(marker, fallback, 1)
+          seccomp.write_text(text)
+          wrapper = Path('KernelSU/kernel/infra/file_wrapper.c')
+          text = wrapper.read_text()
+          text = text.replace(
+              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\nstatic int ksu_wrapper_iopoll',
+              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
+              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)\n'
+              'static int ksu_wrapper_iopoll', 1)
+          text = text.replace(
+              '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n\n#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)',
+              '    return orig->f_op->iopoll(kiocb, spin);\n}\n#endif\n#endif\n\n#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)', 1)
+          text = text.replace('static loff_t ksu_wrapper_remap_file_range',
+                              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                              'static loff_t ksu_wrapper_remap_file_range', 1)
+          text = text.replace('}\n\nstatic int ksu_wrapper_fadvise',
+                              '}\n#endif\n\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+                              'static int ksu_wrapper_fadvise', 1)
+          text = text.replace('    return -EINVAL;\n}\n\nstatic void ksu_release_file_wrapper',
+                              '    return -EINVAL;\n}\n#endif\n\nstatic void ksu_release_file_wrapper', 1)
+          text = text.replace('    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n',
+                              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
+                              '    p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;\n'
+                              '#endif\n', 1)
+          text = text.replace('#else\n    p->ops.mmap_supported_flags = fp->f_op->mmap_supported_flags;\n#endif',
+                              '#else\n#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n'
+                              '    p->ops.mmap_supported_flags = fp->f_op->mmap_supported_flags;\n'
+                              '#endif\n#endif', 1)
+          text = text.replace(
+              '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
+              '    p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;\n',
+              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)\n'
+              '    p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;\n'
+              '    p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;\n'
+              '#endif\n', 1)
+          wrapper.write_text(text)
+          mount_ns = Path('KernelSU/kernel/infra/su_mount_ns.c')
+          mount_ns.write_text(mount_ns.read_text().replace('#include <uapi/linux/mount.h>\n', ''))
+          poll = Path('KernelSU/kernel/infra/file_wrapper.c')
+          text = poll.read_text()
+          old = 'static __poll_t ksu_wrapper_poll(struct file *fp, struct poll_table_struct *pts)'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
+                 'static __poll_t ksu_wrapper_poll(struct file *fp, struct poll_table_struct *pts)\n'
+                 '#else\n'
+                 'static unsigned int ksu_wrapper_poll(struct file *fp, struct poll_table_struct *pts)\n'
+                 '#endif')
+          if old in text:
+              text = text.replace(old, new, 1)
+          poll.write_text(text)
+          event = Path('KernelSU/kernel/sulog/event.c')
+          text = event.read_text()
+          text = text.replace('#include <linux/minmax.h>\n', '#include <linux/kernel.h>\n', 1)
+          event.write_text(text)
+          fd = Path('KernelSU/kernel/sulog/fd.c')
+          text = fd.read_text()
+          if '#include <linux/version.h>\n' not in text:
+              text = text.replace('#include <linux/sched.h>\n',
+                                  '#include <linux/sched.h>\n#include <linux/version.h>\n', 1)
+          old = 'static __poll_t ksu_sulog_poll(struct file *file, poll_table *wait)'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
+                 'static __poll_t ksu_sulog_poll(struct file *file, poll_table *wait)\n'
+                 '#else\n'
+                 'static unsigned int ksu_sulog_poll(struct file *file, poll_table *wait)\n'
+                 '#endif')
+          if old in text:
+              text = text.replace(old, new, 1)
+          fd.write_text(text)
+          assert '#include <linux/minmax.h>' not in event.read_text()
+          assert 'static unsigned int ksu_sulog_poll' in fd.read_text()
+          dispatch = Path('KernelSU/kernel/supercall/dispatch.c')
+          text = dispatch.read_text()
+          if '#include <linux/sched/task.h>\n' not in text:
+              text = text.replace('#include <linux/version.h>\n',
+                                  '#include <linux/version.h>\n#include <linux/sched/task.h>\n', 1)
+          text = text.replace('names = kvcalloc(cmd.count, sizeof(*names), GFP_KERNEL);',
+                              'names = kcalloc(cmd.count, sizeof(*names), GFP_KERNEL);', 1)
+          text = text.replace('addrs = kvcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);',
+                              'addrs = kcalloc(cmd.count, sizeof(*addrs), GFP_KERNEL);', 1)
+          dispatch.write_text(text)
+          assert '#include <linux/sched/task.h>' in dispatch.read_text()
+          assert 'names = kcalloc' in dispatch.read_text()
+          supercall = Path('KernelSU/kernel/supercall/supercall.c')
+          text = supercall.read_text()
+          if '#ifndef TWA_RESUME\n' not in text:
+              marker = '#include <linux/version.h>\n'
+              assert text.count(marker) == 1
+              text = text.replace(marker, marker + '\n#ifndef TWA_RESUME\n#define TWA_RESUME true\n#endif\n', 1)
+              supercall.write_text(text)
+          assert '#define TWA_RESUME true' in supercall.read_text()
+          kpm = Path('KernelSU/kernel/extension/kpm/kpm.c')
+          text = kpm.read_text()
+          if '#include <linux/version.h>\n' not in text:
+              text = text.replace('#include <linux/kernel.h>\n',
+                                  '#include <linux/kernel.h>\n#include <linux/version.h>\n', 1)
+          old = '    if (!access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;'
+          new = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)\n'
+                 '    if (!access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))) return -EFAULT;\n'
+                 '#else\n' + old + '\n#endif')
+          if old in text:
+              text = text.replace(old, new, 1)
+              kpm.write_text(text)
+          avc = Path('KernelSU/kernel/feature/avc_spoof.c')
+          text = avc.read_text().replace('pr_info_ratelimited("avc_spoof: replace tsid %u with %u\\n", *tsid, priv_app_sid);',
+                                          'pr_info("avc_spoof: replace tsid %u with %u\\n", *tsid, priv_app_sid);', 1)
+          avc.write_text(text)
+          assert 'access_ok(VERIFY_WRITE' in kpm.read_text()
+          assert 'pr_info_ratelimited("avc_spoof' not in avc.read_text()
+          observer = Path('KernelSU/kernel/manager/pkg_observer.c')
+          text = observer.read_text()
+          old = '''static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                            const struct qstr *file_name, u32 cookie)
+          {
+              if (!file_name)
+                  return 0;
+              if (mask & FS_ISDIR)
+                  return 0;
+              if (file_name->len == 13 && !memcmp(file_name->name, "packages.list", 13)) {
+                  pr_info("packages.list detected: %d\\n", mask);
+                  ksu_defer_track_throne();
+              }
+              return 0;
+          }
+
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_inode_event = ksu_handle_inode_event,
+          };'''
+          new = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)
+          static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode,
+                                      struct fsnotify_mark *inode_mark,
+                                      struct fsnotify_mark *vfsmount_mark, u32 mask,
+                                      const void *data, int data_type,
+                                      const unsigned char *file_name, u32 cookie,
+                                      struct fsnotify_iter_info *iter_info)
+          {
+              if (!file_name || (mask & FS_ISDIR))
+                  return 0;
+              if (!strcmp(file_name, "packages.list")) {
+                  pr_info("packages.list detected: %d\\n", mask);
+                  ksu_defer_track_throne();
+              }
+              return 0;
+          }
+
+          static const struct fsnotify_ops ksu_ops = {
+              .handle_event = ksu_handle_event,
+          };
+          #else
+          ''' + old + '''
+          #endif'''
+          if old not in text:
+              raise SystemExit('Nova fsnotify callback block not found')
+          text = text.replace(old, new, 1)
+          old = '    if (fsnotify_add_inode_mark(m, inode, 0)) {'
+          new = '''#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)
+              if (fsnotify_add_mark(m, inode, NULL, 0)) {
+          #else
+              if (fsnotify_add_inode_mark(m, inode, 0)) {
+          #endif'''
+          if old not in text:
+              raise SystemExit('Nova fsnotify add-mark call not found')
+          observer.write_text(text.replace(old, new, 1))
+          allowlist = Path('KernelSU/kernel/policy/allowlist.c')
+          text = allowlist.read_text()
+          marker = '#include <linux/kref.h>\n'
+          compat = (marker + '\n#ifndef TWA_RESUME\n#define TWA_RESUME true\n#endif\n'
+                    '#ifndef fallthrough\n#define fallthrough do { } while (0)\n#endif\n')
+          if '#define TWA_RESUME true' not in text:
+              if text.count(marker) != 1:
+                  raise SystemExit('allowlist compatibility marker not found uniquely')
+              text = text.replace(marker, compat, 1)
+          allowlist.write_text(text)
+          profile = Path('KernelSU/kernel/policy/app_profile.c')
+          text = profile.read_text()
+          old = '    atomic_set(&current->seccomp.filter_count, 0);\n'
+          new = ('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)\n'
+                 '    atomic_set(&current->seccomp.filter_count, 0);\n'
+                 '#endif\n')
+          if old in text:
+              text = text.replace(old, new, 1)
+          profile.write_text(text)
+          cpu = Path('KernelSU/kernel/extension/cpu_spoof.c')
+          text = cpu.read_text()
+          text = text.replace('#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n',
+                              '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n'
+                              '#include <vdso/datapage.h>\n#include <vdso/clocksource.h>\n#endif\n', 1)
+          marker = '''            if (part != ARM_CPU_PART_NEOVERSE_N1 &&
+                part != ARM_CPU_PART_CORTEX_A76 &&
+                part != QCOM_CPU_PART_KRYO_4XX_GOLD) {
+          '''
+          if marker in text and '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n                if (part != ARM_CPU_PART_NEOVERSE_N1' not in text:
+              text = text.replace(marker, '#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)\n' + marker, 1)
+              end = '''                }
+            }
+          }
+          }
+          #endif
+          '''
+              if end not in text:
+                  raise SystemExit('cpu_spoof vDSO guard end not found')
+              text = text.replace(end, '''                }
+            }
+          #endif
+          }
+          }
+          #endif
+          ''', 1)
+          cpu.write_text(text)
+          kbuild = Path('KernelSU/kernel/Kbuild')
+          text = kbuild.read_text()
+          text = text.replace('kernelsu-objs += selinux/inode.o\n', '')
+          text = text.replace('kernelsu-objs += selinux/selinux.o\n', '')
+          text = text.replace('kernelsu-objs += selinux/rules.o\n', '')
+          text = text.replace('kernelsu-objs += selinux/sepolicy.o\n', '')
+          text = text.replace('kernelsu-objs += feature/selinux_hide.o\n', '')
+          if 'kernelsu-objs += selinux/compat_414.o\n' not in text:
+              marker = 'kernelsu-objs += runtime/boot_event.o\n'
+              text = text.replace(marker, marker + 'kernelsu-objs += selinux/compat_414.o\n', 1)
+          kbuild.write_text(text)
+          compat = Path('KernelSU/kernel/selinux/compat_414.c')
+          compat.write_text('''// KernelSU SELinux policy mutation is not compatible with the vendor 4.14
+          // policydb layout. Keep public hooks present but fail closed/no-op.
+          #include <linux/errno.h>
+          #include <linux/init.h>
+          #include <linux/printk.h>
+          #include <linux/types.h>
+          #include <linux/uaccess.h>
+          #include <linux/cred.h>
+          #include <linux/fs.h>
+
+          struct inode_security_struct;
+          void setup_ksu_cred(void) { }
+          bool is_task_ksu_domain(const struct cred *cred) { return false; }
+          struct inode_security_struct *ksu_selinux_inode(const struct inode *inode) { return NULL; }
+          bool susfs_is_current_ksu_domain(void) { return false; }
+          void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid) { }
+
+          void apply_kernelsu_rules(void)
+          {
+              pr_warn_once("KernelSU: SELinux policy mutation disabled on kernel 4.14\\n");
+          }
+
+          int handle_sepolicy(void __user *user_data, u64 data_len)
+          {
+              return -EOPNOTSUPP;
+          }
+
+          void ksu_selinux_hide_init(void) { }
+          void ksu_selinux_hide_exit(void) { }
+          void ksu_selinux_hide_drop_backup_if_unused(void) { }
+          void ksu_selinux_hide_handle_second_stage(void) { }
+          void ksu_selinux_hide_handle_post_fs_data(void) { }
+          ''')
+          PYTHON
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          root = Path('KernelSU/kernel')
+          compat = root / 'selinux/compat_414.c'
+          compat.write_text('''#include <linux/errno.h>
+          #include <linux/init.h>
+          #include <linux/printk.h>
+          #include <linux/types.h>
+          #include <linux/uaccess.h>
+          #include <linux/cred.h>
+          #include <linux/fs.h>
+          u32 ksu_file_sid;
+          void cache_sid(void) { ksu_file_sid = 0; }
+          void setup_selinux(const char *domain, struct cred *cred) { }
+          bool is_ksu_domain(void) { return false; }
+          bool is_zygote(const struct cred *cred) { return false; }
+          bool is_init(const struct cred *cred) { return false; }
+          bool is_adbd(const struct cred *cred) { return false; }
+          bool getenforce(void) { return true; }
+          void setenforce(bool enforce) { }
+          void escape_to_root_for_adb_root(void) { }
+          void setup_ksu_cred(void) { }
+          bool is_task_ksu_domain(const struct cred *cred) { return false; }
+          struct inode_security_struct *ksu_selinux_inode(const struct inode *inode) { return NULL; }
+          bool susfs_is_current_ksu_domain(void) { return false; }
+          bool susfs_is_current_zygote_domain(void) { return false; }
+          void susfs_try_umount_all(uid_t uid) { }
+          void ksu_try_umount(const char *mnt, bool check_mnt, int flags, uid_t uid) { }
+          void apply_kernelsu_rules(void) { pr_warn_once("KernelSU: SELinux policy mutation disabled on kernel 4.14\\n"); }
+          int handle_sepolicy(void __user *user_data, u64 data_len) { return -EOPNOTSUPP; }
+          void ksu_selinux_hide_init(void) { }
+          void ksu_selinux_hide_exit(void) { }
+          void ksu_selinux_hide_drop_backup_if_unused(void) { }
+          void ksu_selinux_hide_handle_second_stage(void) { }
+          void ksu_selinux_hide_handle_post_fs_data(void) { }
+          ''')
+          compat_h = root / 'kernel_compat.h'
+          compat_h.write_text('''#ifndef __KSU_H_KERNEL_COMPAT
+          #define __KSU_H_KERNEL_COMPAT
+          #include <linux/fs.h>
+          #include <linux/version.h>
+          #include <linux/uaccess.h>
+          #include <linux/string.h>
+          #include <linux/sched/task.h>
+          #include <asm/pgtable.h>
+          #include <asm/cacheflush.h>
+          #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)
+          static inline unsigned long ksu_copy_from_user_nofault(void *to, const void __user *from, unsigned long n) { return copy_from_user(to, from, n); }
+          static inline unsigned long ksu_copy_to_user_nofault(void __user *to, const void *from, unsigned long n) { return copy_to_user(to, from, n); }
+          static inline long ksu_strncpy_from_user_nofault(char *to, const char __user *from, long n) { return strncpy_from_user(to, from, n); }
+          static inline int ksu_copy_to_kernel_nofault(void *to, const void *from, unsigned long n) { memcpy(to, from, n); return 0; }
+          #define copy_from_user_nofault ksu_copy_from_user_nofault
+          #define copy_to_user_nofault ksu_copy_to_user_nofault
+          #define strncpy_from_user_nofault ksu_strncpy_from_user_nofault
+          #define copy_to_kernel_nofault ksu_copy_to_kernel_nofault
+          #define __pte_to_phys(pte) (pte_pfn(pte) << PAGE_SHIFT)
+          #define __flush_icache_range flush_icache_range
+          static inline int ksu_strscpy_pad(char *d, const char *s, size_t n) { size_t l; if (!n) return 0; l = strlcpy(d, s, n); if (l < n) memset(d + l, 0, n - l); return l >= n ? -E2BIG : (int)l; }
+          #define strscpy_pad ksu_strscpy_pad
+          #endif
+          static long ksu_copy_from_user_retry(void *to, const void __user *from, unsigned long n) { long r = copy_from_user_nofault(to, from, n); return likely(!r) ? r : copy_from_user(to, from, n); }
+          #endif
+          ''')
+          kbuild = root / 'Kbuild'
+          text = kbuild.read_text()
+          if '-include $(KSU_KERNEL_DIR)/kernel_compat.h' not in text:
+              text = text.replace('ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include\n', 'ccflags-y += -I$(KSU_KERNEL_DIR) -I$(KSU_KERNEL_DIR)/include\nccflags-y += -include $(KSU_KERNEL_DIR)/kernel_compat.h\n', 1)
+          kbuild.write_text(text)
+          util = root / 'include/util.h'
+          text = util.read_text().replace('#if defined(__aarch64__)\n#define KSU_SYS_PREFIX(name) __arm64_sys_##name', '#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)\n#define KSU_SYS_PREFIX(name) sys_##name\n#elif defined(__aarch64__)\n#define KSU_SYS_PREFIX(name) __arm64_sys_##name', 1)
+          text = text.replace('#define ksyscall_0(name) __ksyscall(name, 0, 0, 0, 0, 0, 0)', '#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 17, 0)\n#define __KSU_DIRECT_SYSCALL(name) sys_##name\n#define ksyscall_0(name) __KSU_DIRECT_SYSCALL(name)()\n#define ksyscall_1(name, a) __KSU_DIRECT_SYSCALL(name)(a)\n#define ksyscall_2(name, a, b) __KSU_DIRECT_SYSCALL(name)(a, b)\n#else\n#define ksyscall_0(name) __ksyscall(name, 0, 0, 0, 0, 0, 0)', 1)
+          text = text.replace('#define ksyscall_6(name, a, b, c, d, e, f) __ksyscall(name, a, b, c, d, e, f)', '#define ksyscall_6(name, a, b, c, d, e, f) __ksyscall(name, a, b, c, d, e, f)\n#endif', 1)
+          util.write_text(text)
+          ns = Path('fs/namespace.c')
+          text = ns.read_text()
+          marker = '\nstatic bool has_locked_children(struct mount *mnt, struct dentry *dentry)'
+          if 'int path_mount(const char *dev_name' not in text:
+              text = text.replace(marker, '\nint path_mount(const char *dev_name, struct path *path, const char *type_page, unsigned long flags, void *data_page) { if (flags & (MS_SHARED | MS_PRIVATE | MS_SLAVE | MS_UNBINDABLE)) return do_change_type(path, flags); return -EOPNOTSUPP; }\n' + marker, 1)
+          ns.write_text(text)
+          internal = Path('fs/internal.h')
+          text = internal.read_text()
+          if 'extern int path_mount(' not in text:
+              text = text.replace('extern int path_umount(struct path *, int);\n', 'extern int path_umount(struct path *, int);\nextern int path_mount(const char *, struct path *, const char *, unsigned long, void *);\n', 1)
+          internal.write_text(text)
+          profile = root / 'policy/app_profile.c'
+          text = profile.read_text()
+          if '#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)' not in text:
+              text = text.replace('static void disable_seccomp(void)\n{', 'static void disable_seccomp(void)\n{\n#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 16, 0)\n    pr_warn_once("KernelSU: seccomp disabling unavailable on kernel 4.14\\n");\n    return;\n#else\n', 1)
+              text = text.replace('    kfree(fake);\n}\n\nint escape_with_root_profile', '    kfree(fake);\n#endif\n}\n\nint escape_with_root_profile', 1)
+          profile.write_text(text)
+          PYTHON
+          scripts/selinux/genheaders/genheaders \
+            security/selinux/flask.h security/selinux/av_permissions.h
+          test -f security/selinux/flask.h
+          make ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 drivers/kernelsu/ 2>&1 | tee compat.log
+          grep -q '^int path_umount' fs/namespace.c
+          grep -q '^static int can_umount' fs/namespace.c
+          grep -q 'int path_umount' fs/internal.h
+          test -f drivers/kernelsu/kernelsu.o
+          echo "compat edits applied"
+
+      - name: Build kernel
+        shell: bash
+        run: |
+          make -k ARCH=arm64 CC=clang LD=ld.lld CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            WT_BSP_BOARD_NAME=P15945AA1 -j$(nproc) Image dtbs 2>&1 | tee build.log
+          test -f arch/arm64/boot/Image
+          ls -l arch/arm64/boot/Image
+          strings arch/arm64/boot/Image | grep -m1 "Linux version" || true
+
+      - name: Verify module CRCs against stock vendor modules
+        shell: bash
+        run: |
+          # SUSFS adds fields to task_struct/inode. If that changes the CRC of a symbol
+          # the stock vendor modules (mali_gondul, sprd_camera) import, the kernel will
+          # reject them at boot (bootloop). This step lists every mismatch.
+          test -f .github/vendor_crcs.txt || { echo "::warning::.github/vendor_crcs.txt missing, skipping CRC check"; exit 0; }
+          python3 - <<'PY'
+          import os, subprocess, sys
+          need = {}
+          for line in open(".github/vendor_crcs.txt"):
+              if line.strip():
+                  name, crc = line.split()
+                  need[name] = int(crc, 16)
+          out = subprocess.run(["llvm-nm", "vmlinux"], capture_output=True, text=True).stdout
+          have = {}
+          for line in out.splitlines():
+              p = line.split()
+              if len(p) == 3 and p[2].startswith("__crc_"):
+                  have[p[2][6:]] = int(p[0], 16)
+          bad = [(n, need[n], have.get(n)) for n in sorted(need) if have.get(n) != need[n]]
+          lines = ["## Vendor module CRC check",
+                   f"kernel exports {len(have)} CRCs, vendor modules need {len(need)}, mismatches: {len(bad)}"]
+          if not have:
+              lines.append("ERROR: no __crc_ symbols found in vmlinux (is CONFIG_MODVERSIONS on?)")
+          for n, want, got in bad[:60]:
+              lines.append(f"- {n}: vendor wants 0x{want:08x}, kernel has " + ("MISSING" if got is None else f"0x{got:08x}"))
+          lines.append(f"module_layout: vendor 0x{need.get('module_layout', 0):08x}, kernel 0x{have.get('module_layout', 0):08x}")
+          text = "\n".join(lines)
+          print(text)
+          open(os.environ["GITHUB_STEP_SUMMARY"], "a").write(text + "\n")
+          sys.exit(1 if (bad or not have) else 0)
+          PY
+
+
+      - name: Print errors to summary
+        if: always()
+        run: |
+          {
+            echo "## Compiler"
+            echo '```'
+            clang --version | head -1 || true
+            echo '```'
+            echo "## Build errors"
+            echo '```'
+            grep -E "error:|\*\*\* .*Error|No rule to make target|undefined reference|not found" build.log | head -80 || echo "none matched"
+            echo '```'
+            echo "## SUSFS patch rejects (expected: namei/namespace/fdinfo/task_mmu/readdir)"
+            echo '```'
+            grep -E "FAILED|rej" susfs_patch.log || echo "none"
+            echo '```'
+            echo "## Last 40 lines of build.log"
+            echo '```'
+            tail -n 40 build.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-sukisu-susfs-nomount
+          path: |
+            build.log
+            config.log
+            susfs_patch.log
+            compat.log
+          if-no-files-found: warn
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-sukisu-susfs-nomount
+          path: |
+            arch/arm64/boot/Image
+            arch/arm64/boot/Image.gz
+            arch/arm64/boot/dts/**/*.dtb
+          if-no-files-found: error
