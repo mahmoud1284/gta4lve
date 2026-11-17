@@ -592,7 +592,7 @@ jobs:
                            'static struct vfsmount *anon_inode_mnt __read_mostly;\n'
                            'static struct file *ksu_anon_inode_create_getfile_compat')
           if legacy in text and compat_marker not in text:
-              compat = ('#else\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\n'
+              compat = ('#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 16, 0)\n'
                         'static struct vfsmount *anon_inode_mnt __read_mostly;\n'
                         'static struct file *ksu_anon_inode_create_getfile_compat(const char *name,\n'
                         '                                                         const struct file_operations *fops,\n'
