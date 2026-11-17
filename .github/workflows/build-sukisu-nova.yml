@@ -472,17 +472,17 @@ jobs:
           p = Path('KernelSU/kernel/supercall/supercall.c')
           t = p.read_text()
           old = '''    struct pt_regs *real_regs = PT_REAL_REGS(regs);
-          int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
-          int magic2 = (int)PT_REGS_PARM2(real_regs);
+              int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
+              int magic2 = (int)PT_REGS_PARM2(real_regs);
           '''
           new = '''#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
-          struct pt_regs *real_regs = PT_REAL_REGS(regs);
-          int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
-          int magic2 = (int)PT_REGS_PARM2(real_regs);
+              struct pt_regs *real_regs = PT_REAL_REGS(regs);
+              int magic1 = (int)PT_REGS_SYSCALL_PARM1(real_regs);
+              int magic2 = (int)PT_REGS_PARM2(real_regs);
           #else
-          /* Pre-4.17 sys_reboot receives the raw user arguments directly. */
-          int magic1 = (int)PT_REGS_SYSCALL_PARM1(regs);
-          int magic2 = (int)PT_REGS_PARM2(regs);
+              /* Pre-4.17 sys_reboot receives the raw user arguments directly. */
+              int magic1 = (int)PT_REGS_SYSCALL_PARM1(regs);
+              int magic2 = (int)PT_REGS_PARM2(regs);
           #endif
           '''
           assert t.count(old) == 1, 'reboot magic block not found'
