@@ -927,6 +927,12 @@ jobs:
               text = text.replace('    kfree(fake);\n}\n\nint escape_with_root_profile', '    kfree(fake);\n#endif\n}\n\nint escape_with_root_profile', 1)
           profile.write_text(text)
           PYTHON
+          # prepare does not build this legacy host tool on the GitHub runner.
+          # Build it explicitly before generating the SELinux headers.
+          gcc -Iinclude/uapi -Iinclude -Isecurity/selinux/include \
+            -o scripts/selinux/genheaders/genheaders \
+            scripts/selinux/genheaders/genheaders.c
+          test -x scripts/selinux/genheaders/genheaders
           scripts/selinux/genheaders/genheaders \
             security/selinux/flask.h security/selinux/av_permissions.h
           test -f security/selinux/flask.h
