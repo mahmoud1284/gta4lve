@@ -1328,6 +1328,63 @@ jobs:
           sys.exit(1 if (bad or not have) else 0)
           PY
 
+      # Flashable zip for TWRP/OrangeFox/etc. Kernel-only: split_boot + flash_boot keep the stock
+      # ramdisk and dtb from the boot partition and only swap in the freshly built Image.
+      - name: Package AnyKernel3 zip
+        run: |
+          set -euo pipefail
+          AK3_REF=41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+          rm -rf ak3 && mkdir ak3
+          git -C ak3 init -q
+          git -C ak3 fetch -q --depth 1 https://github.com/osm0sis/AnyKernel3.git "$AK3_REF"
+          git -C ak3 checkout -q FETCH_HEAD
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules/* ak3/patch/* ak3/ramdisk/*
+          cp arch/arm64/boot/Image ak3/Image
+          KVER=$(sed -n 's/.*UTS_RELEASE "\(.*\)".*/\1/p' include/generated/utsrelease.h)
+          cat > ak3/anykernel.sh <<'AKEOF'
+          ### AnyKernel3 - gta4lve: SukiSU Nova + SUSFS + NoMount + KPM
+          properties() { '
+          kernel.string=gta4lve 4.14 - SukiSU Nova + SUSFS + NoMount + KPM
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=gta4lve
+          device.name2=gta4lvexx
+          device.name3=gta4lvewifi
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          boot_attributes() { :; }
+
+          BLOCK=/dev/block/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # kernel-only install: keep the stock ramdisk and dtb
+          split_boot;
+          flash_boot;
+          AKEOF
+          bash -n ak3/anykernel.sh
+          ZIP="gta4lve-${KVER}-nova-susfs-nomount-kpm-$(date -u +%Y%m%d-%H%M)-AnyKernel3.zip"
+          (cd ak3 && zip -r9q "../$ZIP" . -x '.git*')
+          unzip -l "$ZIP" | grep -E "anykernel.sh|META-INF/com/google/android/update-binary|[ /]Image$"
+          sha256sum "$ZIP" | tee "$ZIP.sha256"
+          {
+            echo "## Flashable zip"
+            echo "\`$ZIP\` (AnyKernel3, kernel-only, boot partition)"
+            echo '```'
+            cat "$ZIP.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Print errors to summary
         if: always()
@@ -1371,4 +1428,14 @@ jobs:
             arch/arm64/boot/Image
             arch/arm64/boot/Image.gz
             arch/arm64/boot/dts/**/*.dtb
+          if-no-files-found: error
+
+      - name: Upload flashable AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: gta4lve-AnyKernel3-flashable
+          path: |
+            *-AnyKernel3.zip
+            *-AnyKernel3.zip.sha256
+          compression-level: 0
           if-no-files-found: error
